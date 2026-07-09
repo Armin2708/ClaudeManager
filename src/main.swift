@@ -755,6 +755,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     // While a slide animation is in flight, periodic refresh must not stomp
     // the frame with a non-animated setFrame.
     private var transitionUntil = Date.distantPast
+    // Expanded panel dragged off the notch → free-floating card.
+    private var isDetached = false
     private var content: ContentView!
     private var headerMark: ClaudeMark!
     private var headerLabel: NSTextField!
@@ -840,6 +842,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         headerMark.isHidden = true
         headerCounts.isHidden = true
         headerLabel.attributedStringValue = NSAttributedString(string: "")
+        isDetached = false
+        panel.hasShadow = false
+        panel.level = .screenSaver
+        panel.isMovableByWindowBackground = false
         NSLayoutConstraint.deactivate(expandedConstraints)
         // Guard BEFORE the render below so it can't snap frame/mask mid-slide.
         if animate { transitionUntil = Date().addingTimeInterval(0.5) }
@@ -872,19 +878,30 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     /// The expanded panel hangs from the notch: flush to the top edge,
     /// centered on the notch, same silhouette — part of the notch UI.
+    /// Once dragged off (isDetached), it's a free-floating card: it keeps the
+    /// user's position and only its height follows the row count.
     private func positionExpanded(rows: [Session], animate: Bool = false) {
         guard let screen = notchScreen else { return }
         let notch = notchMetrics(on: screen)
-        headerTop.constant = notch.height + 6
+        let topInset: CGFloat = isDetached ? 4 : notch.height + 6
+        headerTop.constant = topInset
         let headerH: CGFloat = 14 + 8
         let rowsH = rows.reduce(CGFloat(0)) { $0 + ($1.parentId != nil ? 36 : 46) }
             + CGFloat(max(rows.count - 1, 0)) * 3
         let footerH: CGFloat = footerLabel.isHidden ? 0 : 18
-        let h = notch.height + 6 + headerH + rowsH + footerH + 12
+        let h = max(topInset + headerH + rowsH + footerH + 12,
+                    isDetached ? 64 : notch.height + 44)
+        if isDetached {
+            // Keep the user's placement; grow/shrink from the top edge.
+            let f = panel.frame
+            setFrameKeepingMask(NSRect(x: f.minX, y: f.maxY - h, width: f.width, height: h),
+                                animate: animate, bottomRadius: 14)
+            return
+        }
         let w = max(panelWidth + 60, notch.width + 60)
         let x = screen.frame.midX - w / 2
         let y = screen.frame.maxY - h
-        setFrameKeepingMask(NSRect(x: x, y: y, width: w, height: max(h, notch.height + 44)),
+        setFrameKeepingMask(NSRect(x: x, y: y, width: w, height: h),
                             animate: animate, bottomRadius: 20)
     }
 
@@ -915,19 +932,27 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// coordinates): top corners flare OUTWARD into the bezel, bottom corners
     /// are convex. This is what makes it read as hardware.
     private func applyNotchMask(size: CGSize, bottomRadius: CGFloat, animated: Bool = false) {
-        let tr: CGFloat = 8    // top flare radius
-        let br: CGFloat = bottomRadius
         let w = size.width, h = size.height
-        let p = CGMutablePath()
-        p.move(to: CGPoint(x: 0, y: h))
-        p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: tr, y: h))
-        p.addLine(to: CGPoint(x: tr, y: br))
-        p.addQuadCurve(to: CGPoint(x: tr + br, y: 0), control: CGPoint(x: tr, y: 0))
-        p.addLine(to: CGPoint(x: w - tr - br, y: 0))
-        p.addQuadCurve(to: CGPoint(x: w - tr, y: br), control: CGPoint(x: w - tr, y: 0))
-        p.addLine(to: CGPoint(x: w - tr, y: h - tr))
-        p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - tr, y: h))
-        p.closeSubpath()
+        let p: CGMutablePath
+        if isDetached && !isCollapsed {
+            // Free-floating card: plain rounded rectangle.
+            p = CGMutablePath()
+            p.addRoundedRect(in: CGRect(x: 0, y: 0, width: w, height: h),
+                             cornerWidth: 14, cornerHeight: 14)
+        } else {
+            let tr: CGFloat = 8    // top flare radius
+            let br: CGFloat = bottomRadius
+            p = CGMutablePath()
+            p.move(to: CGPoint(x: 0, y: h))
+            p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: tr, y: h))
+            p.addLine(to: CGPoint(x: tr, y: br))
+            p.addQuadCurve(to: CGPoint(x: tr + br, y: 0), control: CGPoint(x: tr, y: 0))
+            p.addLine(to: CGPoint(x: w - tr - br, y: 0))
+            p.addQuadCurve(to: CGPoint(x: w - tr, y: br), control: CGPoint(x: w - tr, y: 0))
+            p.addLine(to: CGPoint(x: w - tr, y: h - tr))
+            p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - tr, y: h))
+            p.closeSubpath()
+        }
         if animated, let old = islandMask.path {
             let a = CABasicAnimation(keyPath: "path")
             a.fromValue = old
@@ -943,6 +968,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func applyExpandedLayout(animate: Bool = false) {
+        isDetached = false
+        panel.hasShadow = false
+        panel.level = .screenSaver
+        panel.isMovableByWindowBackground = true   // drag off the notch to detach
         islandMark.isHidden = true
         islandCounts.isHidden = true
         // Slide down out of the notch first, then reveal the content —
@@ -1122,8 +1151,44 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.isMovableByWindowBackground = false
 
+        // Dragging the expanded panel detaches it from the notch.
+        NotificationCenter.default.addObserver(self, selector: #selector(panelDidMove),
+                                               name: NSWindow.didMoveNotification, object: panel)
+
         panel.contentView = effectView
         panel.orderFrontRegardless()
+    }
+
+    /// User drags the expanded panel: detach it into a floating card. If it's
+    /// later dropped onto the notch, swallow it back.
+    @objc private func panelDidMove(_ note: Notification) {
+        guard !isCollapsed, Date() >= transitionUntil else { return }
+        guard NSEvent.pressedMouseButtons != 0 else { return }
+        if !isDetached {
+            isDetached = true
+            panel.hasShadow = true
+            panel.level = .floating
+            applyNotchMask(size: panel.frame.size, bottomRadius: 14)
+        }
+        scheduleDropCheck()
+    }
+
+    private func scheduleDropCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self = self, self.isDetached, !self.isCollapsed else { return }
+            if NSEvent.pressedMouseButtons != 0 {
+                self.scheduleDropCheck()
+                return
+            }
+            // Dropped — on the notch? Swallow it back.
+            if let screen = self.notchScreen,
+               self.panel.frame.maxY >= screen.visibleFrame.maxY - 6,
+               abs(self.panel.frame.midX - screen.frame.midX) < self.notchMetrics(on: screen).width {
+                self.isCollapsed = true
+                UserDefaults.standard.set(true, forKey: "IslandCollapsed")
+                self.applyIslandLayout(animate: true)
+            }
+        }
     }
 
     // MARK: Refresh
