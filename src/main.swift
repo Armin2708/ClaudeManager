@@ -57,6 +57,9 @@ struct Session {
     let status: SessionStatus
     // True when the effective status came from a hook status file (overlay).
     let fromFile: Bool
+    // Set when this session's process is a descendant of another live
+    // session's process — i.e. a subagent/teammate spawned by that session.
+    var parentId: String? = nil
 }
 
 enum HostApp {
@@ -200,6 +203,23 @@ final class HostResolver {
 
     func prune(livePids: Set<Int>) {
         cache = cache.filter { livePids.contains($0.key) }
+        ancestorCache = ancestorCache.filter { livePids.contains($0.key) }
+    }
+
+    // Ancestor pid chain (nearest first), cached per pid.
+    private var ancestorCache: [Int: [Int]] = [:]
+
+    func ancestors(of pid: Int) -> [Int] {
+        if let cached = ancestorCache[pid] { return cached }
+        var chain: [Int] = []
+        var current = pid
+        for _ in 0..<24 {
+            guard current > 1, let info = procInfo(current), info.ppid > 1 else { break }
+            chain.append(info.ppid)
+            current = info.ppid
+        }
+        ancestorCache[pid] = chain
+        return chain
     }
 
     private func procInfo(_ pid: Int) -> (ppid: Int, comm: String)? {
@@ -274,7 +294,7 @@ final class TitleResolver {
                     guard parts.count == 2 else { continue }
                     // iTerm reports "/dev/ttys012"; ps reports "ttys012".
                     let tty = (String(parts[0]) as NSString).lastPathComponent
-                    newTitles[tty] = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                    newTitles[tty] = Self.sanitize(String(parts[1]))
                 }
             }
         }
@@ -282,6 +302,24 @@ final class TitleResolver {
             ttyByPid = newTtyByPid
             if !newTitles.isEmpty { titlesByTty = newTitles }
         }
+    }
+
+    /// iTerm session names arrive as "⠂ Actual Title (node)": a braille
+    /// spinner / status glyph prefix from Claude Code's terminal-title updates
+    /// plus iTerm's trailing job name. Strip both, keep the real title.
+    static func sanitize(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespaces)
+        // Leading spinner/status glyphs (braille range + common markers).
+        while let first = s.unicodeScalars.first,
+              (0x2800...0x28FF).contains(first.value) || "✳✶●○◐◓◑◒*".unicodeScalars.contains(first) {
+            s.removeFirst()
+            s = s.trimmingCharacters(in: .whitespaces)
+        }
+        // Trailing " (job)" appended by iTerm (single token, e.g. "(node)").
+        if let r = s.range(of: #"\s*\([A-Za-z0-9._-]+\)$"#, options: .regularExpression) {
+            s.removeSubrange(r)
+        }
+        return s.trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -318,6 +356,18 @@ final class DataSource {
             }
             sessions.append(Session(sessionId: a.sessionId, name: a.name, cwd: a.cwd,
                                     pid: a.pid, status: effective, fromFile: fromFile))
+        }
+
+        // Subagent nesting: a session whose process descends from another live
+        // session's process is that session's child (nearest ancestor wins).
+        let sessionByPid = Dictionary(uniqueKeysWithValues: sessions.map { ($0.pid, $0.sessionId) })
+        for i in sessions.indices {
+            for anc in HostResolver.shared.ancestors(of: sessions[i].pid) {
+                if let parentSid = sessionByPid[anc], parentSid != sessions[i].sessionId {
+                    sessions[i].parentId = parentSid
+                    break
+                }
+            }
         }
         return Result(sessions: sessions, reachable: true)
     }
@@ -443,6 +493,7 @@ final class RowView: NSView {
     private let projectLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let glyph = NSImageView()
+    private var dotLeading: NSLayoutConstraint!
     var onClick: ((RowView) -> Void)?
 
     init(session: Session) {
@@ -478,9 +529,10 @@ final class RowView: NSView {
         addSubview(statusLabel)
         addSubview(glyph)
 
+        dotLeading = dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 38),
-            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            dotLeading,
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
             dot.widthAnchor.constraint(equalToConstant: 10),
             dot.heightAnchor.constraint(equalToConstant: 10),
@@ -509,9 +561,18 @@ final class RowView: NSView {
     func update(session: Session) {
         self.session = session
         dot.configure(session.status)
-        nameLabel.stringValue = TitleResolver.shared.title(for: session) ?? session.name
-        let base = (session.cwd as NSString).lastPathComponent
-        projectLabel.stringValue = base.isEmpty ? session.cwd : "— \(base)"
+        // Subagents render inline under their parent: indented + marked.
+        let isChild = session.parentId != nil
+        dotLeading.constant = isChild ? 28 : 10
+        let title = TitleResolver.shared.title(for: session) ?? session.name
+        nameLabel.stringValue = isChild ? "└ \(title)" : title
+        nameLabel.font = NSFont.systemFont(ofSize: isChild ? 11.5 : 12.5, weight: isChild ? .medium : .semibold)
+        // Repo-style path: home-relative with ~ (e.g. "~/Desktop/my-repo").
+        let home = NSHomeDirectory()
+        let pretty = session.cwd.hasPrefix(home)
+            ? "~" + session.cwd.dropFirst(home.count)
+            : session.cwd
+        projectLabel.stringValue = pretty
         statusLabel.stringValue = session.status.label
         statusLabel.textColor = session.status.color
         let host = HostResolver.shared.host(forPid: session.pid)
@@ -685,9 +746,21 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func statusOrder(_ s: SessionStatus) -> Int { s.rawValue }
 
     private func render(sessions: [Session]) {
-        let sorted = sessions.sorted { a, b in
+        // Two-level ordering: top-level sessions by status, each followed
+        // inline by its subagent children (also by status). A child whose
+        // parent vanished is promoted to top level.
+        let byStatus: (Session, Session) -> Bool = { a, b in
             if a.status.rawValue != b.status.rawValue { return a.status.rawValue < b.status.rawValue }
             return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+        }
+        let ids = Set(sessions.map { $0.sessionId })
+        let topLevel = sessions.filter { $0.parentId == nil || !ids.contains($0.parentId!) }
+        let childrenOf = Dictionary(grouping: sessions.filter { $0.parentId != nil && ids.contains($0.parentId!) },
+                                    by: { $0.parentId! })
+        var sorted: [Session] = []
+        for parent in topLevel.sorted(by: byStatus) {
+            sorted.append(parent)
+            sorted.append(contentsOf: (childrenOf[parent.sessionId] ?? []).sorted(by: byStatus))
         }
 
         // Diff rows by sessionId to preserve pulse animation continuity.
@@ -790,7 +863,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         if let idx = lastSessions.firstIndex(where: { $0.sessionId == session.sessionId }) {
             let s = lastSessions[idx]
             lastSessions[idx] = Session(sessionId: s.sessionId, name: s.name, cwd: s.cwd,
-                                        pid: s.pid, status: .idle, fromFile: true)
+                                        pid: s.pid, status: .idle, fromFile: true,
+                                        parentId: s.parentId)
             render(sessions: lastSessions)
         }
     }
