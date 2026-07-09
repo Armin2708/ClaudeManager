@@ -854,7 +854,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         islandMark.isHidden = true
         islandCounts.isHidden = true
         positionIsland(animate: animate)
-        DispatchQueue.main.asyncAfter(deadline: .now() + (animate ? 0.44 : 0)) { [weak self] in
+        // Wings appear only after the window has snapped to the island frame
+        // (0.46) so their edge-relative constraints resolve correctly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (animate ? 0.5 : 0)) { [weak self] in
             guard let self = self, self.isCollapsed else { return }
             self.islandMark.isHidden = false
             self.islandCounts.isHidden = false
@@ -904,53 +906,72 @@ final class AppController: NSObject, NSApplicationDelegate {
                             animate: animate, bottomRadius: 20)
     }
 
+    // Generation counter so a newer transition cancels an older one's snap.
+    private var shapeGeneration = 0
+
+    /// Move/resize the black shape. Animated transitions NEVER resize the
+    /// window per-frame (that forces a backing-store realloc + Auto Layout
+    /// pass every frame — visibly laggy). Instead the window jumps once to
+    /// the union of old and new frames (the extra area is transparent) and a
+    /// single GPU-side Core Animation path morph does the visible slide; the
+    /// window snaps to the exact target after the morph lands.
     private func setFrameKeepingMask(_ target: NSRect, animate: Bool, bottomRadius: CGFloat) {
         let changed = abs(panel.frame.minX - target.minX) > 0.5 || abs(panel.frame.minY - target.minY) > 0.5
             || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5
-        if changed {
-            if animate {
-                transitionUntil = Date().addingTimeInterval(0.5)
-                NSAnimationContext.runAnimationGroup { ctx in
-                    // MediaMate-style feel: fast out of the notch, silky settle.
-                    ctx.duration = 0.42
-                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
-                    ctx.allowsImplicitAnimation = true
-                    panel.animator().setFrame(target, display: true)
-                }
-            } else if Date() < transitionUntil {
-                // Never stomp an in-flight slide with an instant jump.
-                return
-            } else {
+        if !animate {
+            if changed {
+                if Date() < transitionUntil { return }  // never stomp a slide
                 panel.setFrame(target, display: true)
             }
+            applyMask(rect: NSRect(origin: .zero, size: target.size),
+                      bottomRadius: bottomRadius, animated: false)
+            return
         }
-        applyNotchMask(size: target.size, bottomRadius: bottomRadius, animated: animate)
+
+        shapeGeneration += 1
+        let gen = shapeGeneration
+        transitionUntil = Date().addingTimeInterval(0.55)
+        let old = panel.frame
+        let union = old.union(target)
+        panel.setFrame(union, display: true)  // one instant, invisible resize
+        // Both shapes expressed in the union window's layer coordinates.
+        let oldLocal = NSRect(x: old.minX - union.minX, y: old.minY - union.minY,
+                              width: old.width, height: old.height)
+        let newLocal = NSRect(x: target.minX - union.minX, y: target.minY - union.minY,
+                              width: target.width, height: target.height)
+        applyMask(rect: oldLocal, bottomRadius: shapeRadius, animated: false)
+        applyMask(rect: newLocal, bottomRadius: bottomRadius, animated: true)
+        shapeRadius = bottomRadius
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) { [weak self] in
+            guard let self = self, self.shapeGeneration == gen else { return }
+            self.panel.setFrame(target, display: true)
+            self.applyMask(rect: NSRect(origin: .zero, size: target.size),
+                           bottomRadius: bottomRadius, animated: false)
+        }
     }
 
-    /// Apple's notch silhouette (DynamicNotchKit's NotchShape, in layer
-    /// coordinates): top corners flare OUTWARD into the bezel, bottom corners
-    /// are convex. This is what makes it read as hardware.
-    private func applyNotchMask(size: CGSize, bottomRadius: CGFloat, animated: Bool = false) {
-        let w = size.width, h = size.height
-        let p: CGMutablePath
+    private var shapeRadius: CGFloat = 13
+
+    /// Apple's notch silhouette in layer coordinates: straight top corners
+    /// flush with the screen edge, convex bottom corners. Detached floating
+    /// cards get a plain rounded rectangle.
+    private func applyMask(rect: NSRect, bottomRadius: CGFloat, animated: Bool) {
+        let x0 = rect.minX, y0 = rect.minY, w = rect.width, h = rect.height
+        let p = CGMutablePath()
         if isDetached && !isCollapsed {
-            // Free-floating card: plain rounded rectangle.
-            p = CGMutablePath()
-            p.addRoundedRect(in: CGRect(x: 0, y: 0, width: w, height: h),
+            p.addRoundedRect(in: CGRect(x: x0, y: y0, width: w, height: h),
                              cornerWidth: 14, cornerHeight: 14)
         } else {
-            // Straight top corners flush with the screen edge; only the
-            // bottom corners are rounded.
             let br: CGFloat = bottomRadius
-            p = CGMutablePath()
-            p.move(to: CGPoint(x: 0, y: h))
-            p.addLine(to: CGPoint(x: 0, y: br))
-            p.addQuadCurve(to: CGPoint(x: br, y: 0), control: CGPoint(x: 0, y: 0))
-            p.addLine(to: CGPoint(x: w - br, y: 0))
-            p.addQuadCurve(to: CGPoint(x: w, y: br), control: CGPoint(x: w, y: 0))
-            p.addLine(to: CGPoint(x: w, y: h))
+            p.move(to: CGPoint(x: x0, y: y0 + h))
+            p.addLine(to: CGPoint(x: x0, y: y0 + br))
+            p.addQuadCurve(to: CGPoint(x: x0 + br, y: y0), control: CGPoint(x: x0, y: y0))
+            p.addLine(to: CGPoint(x: x0 + w - br, y: y0))
+            p.addQuadCurve(to: CGPoint(x: x0 + w, y: y0 + br), control: CGPoint(x: x0 + w, y: y0))
+            p.addLine(to: CGPoint(x: x0 + w, y: y0 + h))
             p.closeSubpath()
         }
+        islandMask.removeAnimation(forKey: "morph")
         if animated, let old = islandMask.path {
             let a = CABasicAnimation(keyPath: "path")
             a.fromValue = old
@@ -1166,7 +1187,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             isDetached = true
             panel.hasShadow = true
             panel.level = .floating
-            applyNotchMask(size: panel.frame.size, bottomRadius: 14)
+            applyMask(rect: NSRect(origin: .zero, size: panel.frame.size),
+                      bottomRadius: 14, animated: false)
         }
         scheduleDropCheck()
     }
