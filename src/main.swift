@@ -366,6 +366,7 @@ final class DataSource {
                                     pid: a.pid, status: effective, fromFile: fromFile))
         }
 
+        dbg("overlay titles=\(titleBySid.mapValues { String($0.prefix(20)) })")
         // Subagent nesting: a session whose process descends from another live
         // session's process is that session's child (nearest ancestor wins).
         let sessionByPid = Dictionary(uniqueKeysWithValues: sessions.map { ($0.pid, $0.sessionId) })
@@ -472,63 +473,30 @@ final class DataSource {
     }
 }
 
-// MARK: - Status dot view (with pulse)
+// MARK: - Status edge bar (the panel's signature: a scannable color column)
 
-final class StatusDot: NSView {
-    private let shape = CAShapeLayer()
-    private let dim: CGFloat = 10
-
+final class StatusBar: NSView {
     override init(frame frameRect: NSRect) {
-        super.init(frame: NSRect(x: 0, y: 0, width: dim, height: dim))
+        super.init(frame: frameRect)
         wantsLayer = true
-        layer?.addSublayer(shape)
+        layer?.cornerRadius = 1.5
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: dim, height: dim) }
-
     func configure(_ status: SessionStatus) {
-        let rect = bounds.insetBy(dx: 1, dy: 1)
-        let path = CGPath(ellipseIn: rect, transform: nil)
-        shape.path = path
-        shape.removeAnimation(forKey: "pulse")
-        shape.opacity = 1
-        switch status {
-        case .working:
-            shape.fillColor = NSColor.systemGreen.cgColor
-            shape.strokeColor = NSColor.clear.cgColor
-            shape.lineWidth = 0
+        layer?.removeAnimation(forKey: "pulse")
+        layer?.opacity = 1
+        layer?.backgroundColor = status.color
+            .withAlphaComponent(status == .idle ? 0.35 : 1.0).cgColor
+        if status == .working {
             let a = CABasicAnimation(keyPath: "opacity")
             a.fromValue = 1.0
-            a.toValue = 0.35
-            a.duration = 0.9
+            a.toValue = 0.3
+            a.duration = 1.1
             a.autoreverses = true
             a.repeatCount = .infinity
             a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            shape.add(a, forKey: "pulse")
-        case .waiting:
-            shape.fillColor = NSColor.systemYellow.cgColor
-            shape.strokeColor = NSColor.clear.cgColor
-            shape.lineWidth = 0
-        case .doneUnseen:
-            shape.fillColor = NSColor.clear.cgColor
-            shape.strokeColor = NSColor.systemOrange.cgColor
-            shape.lineWidth = 2
-        case .error:
-            shape.fillColor = NSColor.systemRed.cgColor
-            shape.strokeColor = NSColor.clear.cgColor
-            shape.lineWidth = 0
-        case .idle:
-            shape.fillColor = NSColor.systemGray.withAlphaComponent(0.6).cgColor
-            shape.strokeColor = NSColor.clear.cgColor
-            shape.lineWidth = 0
-        }
-    }
-
-    override func layout() {
-        super.layout()
-        if let p = shape.path, p.boundingBox.width == 0 {
-            shape.path = CGPath(ellipseIn: bounds.insetBy(dx: 1, dy: 1), transform: nil)
+            layer?.add(a, forKey: "pulse")
         }
     }
 }
@@ -538,12 +506,14 @@ final class StatusDot: NSView {
 final class RowView: NSView {
     let sessionId: String
     private(set) var session: Session
-    private let dot = StatusDot(frame: .zero)
+    private let bar = StatusBar(frame: .zero)
     private let nameLabel = NSTextField(labelWithString: "")
     private let projectLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let glyph = NSImageView()
-    private var dotLeading: NSLayoutConstraint!
+    private var barLeading: NSLayoutConstraint!
+    private var rowHeight: NSLayoutConstraint!
+    private var hovered = false
     var onClick: ((RowView) -> Void)?
 
     init(session: Session) {
@@ -551,57 +521,56 @@ final class RowView: NSView {
         self.session = session
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.cornerRadius = 6
+        layer?.cornerRadius = 8
 
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        projectLabel.translatesAutoresizingMaskIntoConstraints = false
-        glyph.translatesAutoresizingMaskIntoConstraints = false
+        for v in [bar, nameLabel, projectLabel, statusLabel, glyph] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+        }
 
-        nameLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.maximumNumberOfLines = 1
-        projectLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        projectLabel.textColor = .secondaryLabelColor
+        // Repo path in monospace — the terminal's own vernacular.
+        projectLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        projectLabel.textColor = .tertiaryLabelColor
         projectLabel.lineBreakMode = .byTruncatingMiddle
         projectLabel.maximumNumberOfLines = 1
-        glyph.contentTintColor = .tertiaryLabelColor
+        glyph.contentTintColor = .quaternaryLabelColor
         glyph.imageScaling = .scaleProportionallyDown
-        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .medium)
+        statusLabel.font = NSFont.systemFont(ofSize: 9, weight: .bold)
         statusLabel.alignment = .right
         statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        addSubview(dot)
+        addSubview(bar)
         addSubview(nameLabel)
         addSubview(projectLabel)
         addSubview(statusLabel)
         addSubview(glyph)
 
-        dotLeading = dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10)
+        barLeading = bar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12)
+        rowHeight = heightAnchor.constraint(equalToConstant: 46)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 38),
-            dotLeading,
-            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 10),
-            dot.heightAnchor.constraint(equalToConstant: 10),
+            rowHeight,
+            barLeading,
+            bar.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            bar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
+            bar.widthAnchor.constraint(equalToConstant: 3),
 
-            glyph.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            glyph.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            glyph.widthAnchor.constraint(equalToConstant: 16),
-            glyph.heightAnchor.constraint(equalToConstant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            statusLabel.topAnchor.constraint(equalTo: topAnchor, constant: 9),
 
-            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
-            statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            glyph.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            glyph.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            glyph.widthAnchor.constraint(equalToConstant: 13),
+            glyph.heightAnchor.constraint(equalToConstant: 13),
 
-            nameLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 9),
-            nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 5),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: glyph.leadingAnchor, constant: -6),
+            nameLabel.leadingAnchor.constraint(equalTo: bar.trailingAnchor, constant: 10),
+            nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -8),
 
             projectLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            projectLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
-            projectLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -6),
+            projectLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            projectLabel.trailingAnchor.constraint(lessThanOrEqualTo: glyph.leadingAnchor, constant: -8),
         ])
 
         update(session: session)
@@ -610,35 +579,63 @@ final class RowView: NSView {
 
     func update(session: Session) {
         self.session = session
-        dot.configure(session.status)
-        // Subagents render inline under their parent: indented + marked.
+        bar.configure(session.status)
         let isChild = session.parentId != nil
-        dotLeading.constant = isChild ? 28 : 10
+        barLeading.constant = isChild ? 26 : 12
+        rowHeight.constant = isChild ? 36 : 46
         // Synthetic children keep their own name (task/agent description) —
         // never the parent terminal's title (same pid).
         let title = session.childGlyph != nil
             ? session.name
             : (TitleResolver.shared.title(for: session) ?? session.name)
-        nameLabel.stringValue = isChild ? "└ \(title)" : title
-        nameLabel.font = NSFont.systemFont(ofSize: isChild ? 11.5 : 12.5, weight: isChild ? .medium : .semibold)
-        // Repo-style path: home-relative with ~ (e.g. "~/Desktop/my-repo").
-        let home = NSHomeDirectory()
-        let pretty = session.cwd.hasPrefix(home)
-            ? "~" + session.cwd.dropFirst(home.count)
-            : session.cwd
-        projectLabel.stringValue = pretty
-        statusLabel.stringValue = session.status.label
-        statusLabel.textColor = session.status.color
+        nameLabel.stringValue = title
+        nameLabel.font = NSFont.systemFont(ofSize: isChild ? 11 : 13, weight: isChild ? .medium : .semibold)
+        nameLabel.textColor = isChild ? .secondaryLabelColor : .labelColor
+        // Children show what they are instead of the repo path; parents show
+        // the home-relative path in mono.
+        if isChild {
+            projectLabel.stringValue = session.childGlyph == "person.fill" ? "agent" : "task"
+        } else {
+            let home = NSHomeDirectory()
+            projectLabel.stringValue = session.cwd.hasPrefix(home)
+                ? "~" + session.cwd.dropFirst(home.count)
+                : session.cwd
+        }
+        // Status as a tracked-out uppercase word in its color.
+        statusLabel.attributedStringValue = NSAttributedString(
+            string: session.status.label.uppercased(),
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .bold),
+                .kern: 0.9,
+                .foregroundColor: session.status.color,
+            ])
         let symbol = session.childGlyph
             ?? HostResolver.shared.host(forPid: session.pid).glyphSymbol
         glyph.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-
-        if session.status == .waiting {
-            layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.14).cgColor
-        } else {
-            layer?.backgroundColor = NSColor.clear.cgColor
-        }
+        applyBackground()
     }
+
+    private func applyBackground() {
+        var base = NSColor.clear
+        if session.status == .waiting { base = NSColor.systemYellow.withAlphaComponent(0.10) }
+        if session.status == .error { base = NSColor.systemRed.withAlphaComponent(0.10) }
+        if hovered {
+            base = base == .clear
+                ? NSColor.labelColor.withAlphaComponent(0.06)
+                : base.withAlphaComponent(0.16)
+        }
+        layer?.backgroundColor = base.cgColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true; applyBackground() }
+    override func mouseExited(with event: NSEvent) { hovered = false; applyBackground() }
 
     override func mouseDown(with event: NSEvent) {
         // Single click focuses. Right-click handled via menu(for:).
@@ -668,6 +665,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var effectView: NSVisualEffectView!
     private var content: ContentView!
     private var headerLabel: NSTextField!
+    private var headerCounts: NSTextField!
     private var footerLabel: NSTextField!
     private var rowsStack: NSStackView!
     private var timer: Timer?
@@ -711,7 +709,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         effectView.blendingMode = .behindWindow
         effectView.state = .active
         effectView.wantsLayer = true
-        effectView.layer?.cornerRadius = 12
+        effectView.layer?.cornerRadius = 14
         effectView.layer?.masksToBounds = true
         effectView.autoresizingMask = [.width, .height]
 
@@ -721,13 +719,22 @@ final class AppController: NSObject, NSApplicationDelegate {
         effectView.addSubview(content)
 
         headerLabel = NSTextField(labelWithString: "")
-        headerLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        headerLabel.textColor = .secondaryLabelColor
+        headerLabel.attributedStringValue = NSAttributedString(
+            string: "SESSIONS",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .heavy),
+                .kern: 1.5,
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ])
         headerLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        headerCounts = NSTextField(labelWithString: "")
+        headerCounts.alignment = .right
+        headerCounts.translatesAutoresizingMaskIntoConstraints = false
 
         rowsStack = NSStackView()
         rowsStack.orientation = .vertical
-        rowsStack.spacing = 2
+        rowsStack.spacing = 3
         rowsStack.alignment = .leading
         rowsStack.distribution = .fill
         rowsStack.translatesAutoresizingMaskIntoConstraints = false
@@ -739,13 +746,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         footerLabel.isHidden = true
 
         content.addSubview(headerLabel)
+        content.addSubview(headerCounts)
         content.addSubview(rowsStack)
         content.addSubview(footerLabel)
 
         NSLayoutConstraint.activate([
-            headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            headerLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            headerLabel.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
+            headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            headerLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 15),
+
+            headerCounts.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -15),
+            headerCounts.firstBaselineAnchor.constraint(equalTo: headerLabel.firstBaselineAnchor),
+            headerCounts.leadingAnchor.constraint(greaterThanOrEqualTo: headerLabel.trailingAnchor, constant: 8),
 
             rowsStack.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 8),
             rowsStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 6),
@@ -849,20 +860,39 @@ final class AppController: NSObject, NSApplicationDelegate {
             v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         }
 
-        // Header counts real sessions only (synthetic children excluded).
+        // Header counts real sessions only (synthetic children excluded):
+        // colored "● n" pairs, one per active status, quiet text when idle.
         let real = sorted.filter { $0.childGlyph == nil }
-        let errors = real.filter { $0.status == .error }.count
-        let working = real.filter { $0.status == .working }.count
-        let waiting = real.filter { $0.status == .waiting }.count
-        let done = real.filter { $0.status == .doneUnseen }.count
-        var parts: [String] = []
-        if errors > 0 { parts.append("\(errors) error") }
-        if working > 0 { parts.append("\(working) working") }
-        if waiting > 0 { parts.append("\(waiting) waiting") }
-        if done > 0 { parts.append("\(done) done") }
-        headerLabel.stringValue = parts.isEmpty ? "\(real.count) idle" : parts.joined(separator: " · ")
+        let counts: [(Int, SessionStatus)] = [
+            (real.filter { $0.status == .error }.count, .error),
+            (real.filter { $0.status == .waiting }.count, .waiting),
+            (real.filter { $0.status == .working }.count, .working),
+            (real.filter { $0.status == .doneUnseen }.count, .doneUnseen),
+        ]
+        let summary = NSMutableAttributedString()
+        for (n, status) in counts where n > 0 {
+            if summary.length > 0 {
+                summary.append(NSAttributedString(string: "  "))
+            }
+            summary.append(NSAttributedString(string: "●", attributes: [
+                .font: NSFont.systemFont(ofSize: 8),
+                .foregroundColor: status.color,
+                .baselineOffset: 0.5,
+            ]))
+            summary.append(NSAttributedString(string: " \(n)", attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]))
+        }
+        if summary.length == 0 {
+            summary.append(NSAttributedString(string: "all idle", attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]))
+        }
+        headerCounts.attributedStringValue = summary
 
-        resizePanel(rowCount: sorted.count)
+        resizePanel(rows: sorted)
 
         // All-idle → dim.
         let anyActive = sorted.contains { $0.status != .idle }
@@ -875,12 +905,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func resizePanel(rowCount: Int) {
-        let headerH: CGFloat = 10 + 16 + 8
-        let rowsH = CGFloat(max(rowCount, 0)) * 38 + CGFloat(max(rowCount - 1, 0)) * 2
+    private func resizePanel(rows: [Session]) {
+        let headerH: CGFloat = 12 + 14 + 8
+        let rowsH = rows.reduce(CGFloat(0)) { $0 + ($1.parentId != nil ? 36 : 46) }
+            + CGFloat(max(rows.count - 1, 0)) * 3
         let footerH: CGFloat = footerLabel.isHidden ? 0 : 18
         let bottomPad: CGFloat = 10
-        let height = max(60, headerH + rowsH + footerH + bottomPad)
+        let height = max(64, headerH + rowsH + footerH + bottomPad)
 
         var frame = panel.frame
         let delta = height - frame.height
