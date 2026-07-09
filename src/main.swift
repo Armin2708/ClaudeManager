@@ -757,6 +757,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var transitionUntil = Date.distantPast
     // Expanded panel dragged off the notch → free-floating card.
     private var isDetached = false
+    // Lets applyExpandedLayout pre-build rows without triggering positioning.
+    private var suppressPositioning = false
     private var content: ContentView!
     private var headerMark: ClaudeMark!
     private var headerLabel: NSTextField!
@@ -993,37 +995,36 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true   // drag off the notch to detach
         islandMark.isHidden = true
         islandCounts.isHidden = true
-        // Slide down out of the notch first, then reveal the content —
-        // the black shape grows out of the hardware.
+        // Build the FULL content first (invisible behind alpha 0) so the
+        // animation target height is correct from the start — computing it
+        // before the rows exist animates to a stub and jumps later.
         content.alphaValue = animate ? 0 : 1
-        positionExpanded(rows: lastSessions.isEmpty ? [] : sortedForDisplay(lastSessions),
-                         animate: animate)
-        let reveal = { [weak self] in
-            guard let self = self, !self.isCollapsed else { return }
-            NSLayoutConstraint.activate(self.expandedConstraints)
-            self.rowsStack.isHidden = false
-            self.collapseButton.isHidden = false
-            self.footerLabel.isHidden = self.lastReachable
-            self.headerMark.isHidden = false
-            self.headerCounts.isHidden = false
-            self.headerLabel.attributedStringValue = NSAttributedString(
-                string: "SESSIONS",
-                attributes: [
-                    .font: Theme.display(9, .heavy),
-                    .kern: 1.5,
-                    .foregroundColor: Theme.coral.withAlphaComponent(0.9),
-                ])
-            self.render(sessions: self.lastSessions)
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.18
-                self.content.animator().alphaValue = 1
-            }
-        }
+        NSLayoutConstraint.activate(expandedConstraints)
+        rowsStack.isHidden = false
+        collapseButton.isHidden = false
+        footerLabel.isHidden = lastReachable
+        headerMark.isHidden = false
+        headerCounts.isHidden = false
+        headerLabel.attributedStringValue = NSAttributedString(
+            string: "SESSIONS",
+            attributes: [
+                .font: Theme.display(9, .heavy),
+                .kern: 1.5,
+                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
+            ])
+        suppressPositioning = true
+        render(sessions: lastSessions)
+        suppressPositioning = false
+        positionExpanded(rows: sortedForDisplay(lastSessions), animate: animate)
         if animate {
-            // After the slide finishes (0.42s), fade the content in.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.44, execute: reveal)
-        } else {
-            reveal()
+            // Fade the content in once the slide lands.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.40) { [weak self] in
+                guard let self = self, !self.isCollapsed else { return }
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.18
+                    self.content.animator().alphaValue = 1
+                }
+            }
         }
     }
 
@@ -1313,7 +1314,9 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         updateHeaderCounts(sorted: sorted)
 
-        positionExpanded(rows: sorted, animate: false)
+        if !suppressPositioning {
+            positionExpanded(rows: sorted, animate: false)
+        }
     }
 
     private func updateHeaderCounts(sorted: [Session]) {
