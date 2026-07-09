@@ -787,6 +787,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private(set) var isCollapsed = UserDefaults.standard.bool(forKey: "IslandCollapsed")
     // Constraints that only apply expanded (they force a tall minimum height).
     private var expandedConstraints: [NSLayoutConstraint] = []
+    // Hardware-notch shape mask applied to the island.
+    private let islandMask = CAShapeLayer()
 
     private let panelWidth: CGFloat = 280
     private let islandHeight: CGFloat = 34
@@ -847,13 +849,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         headerLabel.attributedStringValue = NSAttributedString(string: "")
         islandMark.isHidden = false
         islandCounts.isHidden = false
-        // Seamless with the hardware: pure black, flush to the top edge,
-        // only the bottom corners rounded — reads as a wider notch.
+        // Seamless with the hardware (per the DynamicNotchKit recipe): pure
+        // black, flush to the top edge, no shadow, screen-saver level,
+        // stationary across Space transitions, and Apple's notch silhouette —
+        // top corners flare outward into the bezel, bottom corners convex.
         panel.appearance = NSAppearance(named: .darkAqua)
         tintView.layer?.backgroundColor = NSColor.black.cgColor
-        effectView.layer?.cornerRadius = 12
-        effectView.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
-        panel.level = .statusBar
+        effectView.layer?.cornerRadius = 0
+        panel.hasShadow = false
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.alphaValue = 1  // the notch never dims
         panel.isMovableByWindowBackground = false  // drags pull it out instead
         NSLayoutConstraint.deactivate(expandedConstraints)
@@ -877,6 +882,29 @@ final class AppController: NSObject, NSApplicationDelegate {
             || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5 {
             panel.setFrame(target, display: true, animate: animate)
         }
+        applyNotchMask(size: target.size)
+    }
+
+    /// Apple's notch silhouette (DynamicNotchKit's NotchShape, in layer
+    /// coordinates): top corners flare OUTWARD into the bezel, bottom corners
+    /// are convex. This is what makes it read as hardware.
+    private func applyNotchMask(size: CGSize) {
+        let tr: CGFloat = 8    // top flare radius
+        let br: CGFloat = 13   // bottom corner radius
+        let w = size.width, h = size.height
+        let p = CGMutablePath()
+        p.move(to: CGPoint(x: 0, y: h))
+        p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: tr, y: h))
+        p.addLine(to: CGPoint(x: tr, y: br))
+        p.addQuadCurve(to: CGPoint(x: tr + br, y: 0), control: CGPoint(x: tr, y: 0))
+        p.addLine(to: CGPoint(x: w - tr - br, y: 0))
+        p.addQuadCurve(to: CGPoint(x: w - tr, y: br), control: CGPoint(x: w - tr, y: 0))
+        p.addLine(to: CGPoint(x: w - tr, y: h - tr))
+        p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - tr, y: h))
+        p.closeSubpath()
+        islandMask.path = p
+        islandMask.frame = CGRect(origin: .zero, size: size)
+        effectView.layer?.mask = islandMask
     }
 
     private func applyExpandedLayout(frameOverride: NSRect? = nil, animate: Bool = false) {
@@ -896,10 +924,11 @@ final class AppController: NSObject, NSApplicationDelegate {
             ])
         panel.appearance = nil
         tintView.layer?.backgroundColor = Theme.surfaceTint.cgColor
+        effectView.layer?.mask = nil
         effectView.layer?.cornerRadius = 14
-        effectView.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
-                                           .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        panel.hasShadow = true
         panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true
         NSLayoutConstraint.activate(expandedConstraints)
         if let f = frameOverride {
