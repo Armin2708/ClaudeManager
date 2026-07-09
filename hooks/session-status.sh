@@ -25,6 +25,15 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 
 FILE="$STATUS_DIR/$SESSION_ID.json"
 
+# Session title: Claude Code appends {"type":"ai-title","aiTitle":...} entries
+# to the transcript — the last one is the current topic title (works for every
+# host app, no macOS permissions needed).
+TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")
+TITLE=""
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+  TITLE=$(grep '"type":"ai-title"' "$TRANSCRIPT" 2>/dev/null | tail -1 | jq -r '.aiTitle // ""' 2>/dev/null || echo "")
+fi
+
 # Atomic write of arbitrary JSON produced by a jq program over the EXISTING
 # file content (or {} if none), so fields like .children survive updates.
 # $1 = jq program; extra args passed through.
@@ -40,11 +49,13 @@ update_file() {
   echo "$existing" | jq \
     --arg session_id "$SESSION_ID" \
     --arg cwd "$CWD" \
+    --arg title "$TITLE" \
     --argjson updated_at "$now" \
     --arg event "$EVENT" \
     "$@" \
     ".session_id = \$session_id
      | (if \$cwd != \"\" then .cwd = \$cwd else . end)
+     | (if \$title != \"\" then .title = \$title else . end)
      | .updated_at = \$updated_at
      | .event = \$event
      | $prog" \

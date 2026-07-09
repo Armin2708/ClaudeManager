@@ -360,7 +360,9 @@ final class DataSource {
                 effective = (a.status == "busy") ? .working : .idle
                 fromFile = false
             }
-            sessions.append(Session(sessionId: a.sessionId, name: a.name, cwd: a.cwd,
+            sessions.append(Session(sessionId: a.sessionId,
+                                    name: titleBySid[a.sessionId] ?? a.name,
+                                    cwd: a.cwd,
                                     pid: a.pid, status: effective, fromFile: fromFile))
         }
 
@@ -431,10 +433,14 @@ final class DataSource {
     }
 
     private var childrenBySid: [String: [ChildInfo]] = [:]
+    // Session topic titles extracted by the hook from transcript ai-title
+    // entries — host-app agnostic (works for VS Code/PyCharm terminals too).
+    private(set) var titleBySid: [String: String] = [:]
 
     private func loadAndReapStatusFiles(liveIds: Set<String>) -> [String: SessionStatus] {
         var overlay: [String: SessionStatus] = [:]
         childrenBySid = [:]
+        titleBySid = [:]
         let fm = FileManager.default
         let dir = Env.statusDir
         guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return overlay }
@@ -450,6 +456,7 @@ final class DataSource {
             }
             let statusStr = (obj["status"] as? String) ?? "idle"
             overlay[sid] = SessionStatus(fileString: statusStr)
+            if let t = obj["title"] as? String, !t.isEmpty { titleBySid[sid] = t }
             if let kids = obj["children"] as? [[String: Any]] {
                 childrenBySid[sid] = kids.compactMap { k in
                     guard let id = k["id"] as? String else { return nil }
