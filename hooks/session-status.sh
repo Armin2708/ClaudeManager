@@ -25,45 +25,72 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null || echo "")
 
 FILE="$STATUS_DIR/$SESSION_ID.json"
 
-# Atomic-ish write: build in a temp file, then mv into place so the panel
-# never observes a partially written status file.
-write_status() {
-  local status="$1"
+# Atomic write of arbitrary JSON produced by a jq program over the EXISTING
+# file content (or {} if none), so fields like .children survive updates.
+# $1 = jq program; extra args passed through.
+update_file() {
+  local prog="$1"; shift
   mkdir -p "$STATUS_DIR" || exit 0
-  local now tmp
+  local now tmp existing
   now=$(date +%s)
+  existing="{}"
+  [ -f "$FILE" ] && existing=$(cat "$FILE" 2>/dev/null || echo "{}")
+  echo "$existing" | jq empty 2>/dev/null || existing="{}"
   tmp=$(mktemp "$STATUS_DIR/.tmp.XXXXXX" 2>/dev/null) || exit 0
-  jq -n \
+  echo "$existing" | jq \
     --arg session_id "$SESSION_ID" \
-    --arg status "$status" \
     --arg cwd "$CWD" \
     --argjson updated_at "$now" \
     --arg event "$EVENT" \
-    '{session_id:$session_id,status:$status,cwd:$cwd,updated_at:$updated_at,event:$event}' \
+    "$@" \
+    ".session_id = \$session_id
+     | (if \$cwd != \"\" then .cwd = \$cwd else . end)
+     | .updated_at = \$updated_at
+     | .event = \$event
+     | $prog" \
     > "$tmp" 2>/dev/null || { rm -f "$tmp"; exit 0; }
   mv -f "$tmp" "$FILE" 2>/dev/null || { rm -f "$tmp"; exit 0; }
 }
 
+write_status() {
+  update_file ".status = \"$1\""
+}
+
 case "$EVENT" in
   UserPromptSubmit)
-    write_status "working"
+    # New turn: reset children (fresh turn starts clean).
+    update_file '.status = "working" | .children = []'
     ;;
   Notification)
     write_status "waiting"
     ;;
   Stop)
     # Reuse the stop-sound guard exactly: still "working" if any background
-    # task is running or any scheduled wakeup (cron) is pending.
+    # task is running or any scheduled wakeup (cron) is pending. Running
+    # background tasks are published as children for the panel to nest.
     RUNNING_TASKS=$(echo "$INPUT" | jq -r '[(.background_tasks // [])[] | select(.status == "running")] | length' 2>/dev/null || echo 0)
     PENDING_CRONS=$(echo "$INPUT" | jq -r '(.session_crons // []) | length' 2>/dev/null || echo 0)
+    TASK_CHILDREN=$(echo "$INPUT" | jq -c '[(.background_tasks // [])[] | select(.status == "running") | {id: (.id // "task"), kind: (.type // "task"), name: (.description // .command // .type // "background task")}]' 2>/dev/null || echo "[]")
     if [ "${RUNNING_TASKS:-0}" -gt 0 ] || [ "${PENDING_CRONS:-0}" -gt 0 ]; then
-      write_status "working"
+      update_file '.status = "working"
+         | .children = ((.children // []) | map(select(.kind == "agent"))) + $tasks' \
+        --argjson tasks "$TASK_CHILDREN"
     else
-      write_status "done_unseen"
+      update_file '.status = "done_unseen" | .children = ((.children // []) | map(select(.kind == "agent")))'
     fi
     ;;
   StopFailure)
     write_status "error"
+    ;;
+  SubagentStart)
+    CHILD=$(echo "$INPUT" | jq -c '{id: (.agent_id // .agentId // .task_id // .id // "agent"), kind: "agent", name: (.agent_name // .name // .description // .agent_type // .subagent_type // "subagent")}' 2>/dev/null || echo '{}')
+    update_file '.children = ((.children // []) | map(select(.id != $child.id))) + [$child]' \
+      --argjson child "$CHILD"
+    ;;
+  SubagentStop)
+    CHILD_ID=$(echo "$INPUT" | jq -r '(.agent_id // .agentId // .task_id // .id // "agent")' 2>/dev/null || echo "agent")
+    update_file '.children = ((.children // []) | map(select(.id != $cid)))' \
+      --arg cid "$CHILD_ID"
     ;;
   SessionEnd)
     rm -f "$FILE" 2>/dev/null || true

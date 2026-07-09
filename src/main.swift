@@ -58,8 +58,11 @@ struct Session {
     // True when the effective status came from a hook status file (overlay).
     let fromFile: Bool
     // Set when this session's process is a descendant of another live
-    // session's process — i.e. a subagent/teammate spawned by that session.
+    // session's process — i.e. a subagent/teammate spawned by that session —
+    // or when this is a synthetic child row (subagent/background task).
     var parentId: String? = nil
+    // SF Symbol override for synthetic child rows ("person" / "terminal").
+    var childGlyph: String? = nil
 }
 
 enum HostApp {
@@ -369,7 +372,25 @@ final class DataSource {
                 }
             }
         }
-        return Result(sessions: sessions, reachable: true)
+
+        // Synthetic child rows: in-session subagents and running background
+        // tasks published by the hook (they have no CLI process of their own).
+        var withChildren = sessions
+        for parent in sessions {
+            for child in childrenBySid[parent.sessionId] ?? [] {
+                withChildren.append(Session(
+                    sessionId: "\(parent.sessionId)#\(child.id)",
+                    name: child.name,
+                    cwd: parent.cwd,
+                    pid: parent.pid,
+                    status: .working,
+                    fromFile: true,
+                    parentId: parent.sessionId,
+                    childGlyph: ["agent", "teammate", "local_agent"].contains(child.kind)
+                        ? "person.fill" : "gearshape.fill"))
+            }
+        }
+        return Result(sessions: withChildren, reachable: true)
     }
 
     private struct Agent {
@@ -400,8 +421,17 @@ final class DataSource {
         return result
     }
 
+    struct ChildInfo {
+        let id: String
+        let kind: String
+        let name: String
+    }
+
+    private var childrenBySid: [String: [ChildInfo]] = [:]
+
     private func loadAndReapStatusFiles(liveIds: Set<String>) -> [String: SessionStatus] {
         var overlay: [String: SessionStatus] = [:]
+        childrenBySid = [:]
         let fm = FileManager.default
         let dir = Env.statusDir
         guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return overlay }
@@ -417,6 +447,16 @@ final class DataSource {
             }
             let statusStr = (obj["status"] as? String) ?? "idle"
             overlay[sid] = SessionStatus(fileString: statusStr)
+            if let kids = obj["children"] as? [[String: Any]] {
+                childrenBySid[sid] = kids.compactMap { k in
+                    guard let id = k["id"] as? String else { return nil }
+                    return ChildInfo(id: id,
+                                     kind: (k["kind"] as? String) ?? "task",
+                                     name: (k["name"] as? String) ?? "subtask")
+                }
+            } else {
+                childrenBySid[sid] = []
+            }
         }
         return overlay
     }
@@ -564,7 +604,11 @@ final class RowView: NSView {
         // Subagents render inline under their parent: indented + marked.
         let isChild = session.parentId != nil
         dotLeading.constant = isChild ? 28 : 10
-        let title = TitleResolver.shared.title(for: session) ?? session.name
+        // Synthetic children keep their own name (task/agent description) —
+        // never the parent terminal's title (same pid).
+        let title = session.childGlyph != nil
+            ? session.name
+            : (TitleResolver.shared.title(for: session) ?? session.name)
         nameLabel.stringValue = isChild ? "└ \(title)" : title
         nameLabel.font = NSFont.systemFont(ofSize: isChild ? 11.5 : 12.5, weight: isChild ? .medium : .semibold)
         // Repo-style path: home-relative with ~ (e.g. "~/Desktop/my-repo").
@@ -575,8 +619,9 @@ final class RowView: NSView {
         projectLabel.stringValue = pretty
         statusLabel.stringValue = session.status.label
         statusLabel.textColor = session.status.color
-        let host = HostResolver.shared.host(forPid: session.pid)
-        glyph.image = NSImage(systemSymbolName: host.glyphSymbol, accessibilityDescription: nil)
+        let symbol = session.childGlyph
+            ?? HostResolver.shared.host(forPid: session.pid).glyphSymbol
+        glyph.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
 
         if session.status == .waiting {
             layer?.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.14).cgColor
@@ -794,17 +839,18 @@ final class AppController: NSObject, NSApplicationDelegate {
             v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         }
 
-        // Header counts.
-        let errors = sorted.filter { $0.status == .error }.count
-        let working = sorted.filter { $0.status == .working }.count
-        let waiting = sorted.filter { $0.status == .waiting }.count
-        let done = sorted.filter { $0.status == .doneUnseen }.count
+        // Header counts real sessions only (synthetic children excluded).
+        let real = sorted.filter { $0.childGlyph == nil }
+        let errors = real.filter { $0.status == .error }.count
+        let working = real.filter { $0.status == .working }.count
+        let waiting = real.filter { $0.status == .waiting }.count
+        let done = real.filter { $0.status == .doneUnseen }.count
         var parts: [String] = []
         if errors > 0 { parts.append("\(errors) error") }
         if working > 0 { parts.append("\(working) working") }
         if waiting > 0 { parts.append("\(waiting) waiting") }
         if done > 0 { parts.append("\(done) done") }
-        headerLabel.stringValue = parts.isEmpty ? "\(sorted.count) idle" : parts.joined(separator: " · ")
+        headerLabel.stringValue = parts.isEmpty ? "\(real.count) idle" : parts.joined(separator: " · ")
 
         resizePanel(rowCount: sorted.count)
 
