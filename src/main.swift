@@ -12,17 +12,39 @@ import ServiceManagement
 
 enum SessionStatus: Int {
     // Ordered by sort priority (lower sorts first).
-    case waiting = 0
-    case working = 1
-    case doneUnseen = 2
-    case idle = 3
+    case error = 0
+    case waiting = 1
+    case working = 2
+    case doneUnseen = 3
+    case idle = 4
 
     init(fileString s: String) {
         switch s {
         case "working": self = .working
         case "waiting": self = .waiting
         case "done_unseen": self = .doneUnseen
+        case "error": self = .error
         default: self = .idle // "idle" or anything unexpected
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .error: return "Error"
+        case .waiting: return "Waiting"
+        case .working: return "Working"
+        case .doneUnseen: return "Done"
+        case .idle: return "Idle"
+        }
+    }
+
+    var color: NSColor {
+        switch self {
+        case .error: return .systemRed
+        case .waiting: return .systemYellow
+        case .working: return .systemGreen
+        case .doneUnseen: return .systemOrange
+        case .idle: return NSColor.systemGray
         }
     }
 }
@@ -71,6 +93,19 @@ enum Env {
     static var agentsCmdOverride: String? {
         if let c = ProcessInfo.processInfo.environment["CLAUDE_AGENTS_CMD"], !c.isEmpty { return c }
         return nil
+    }
+}
+
+// Debug logging to file (enabled while diagnosing click-to-focus).
+func dbg(_ msg: String) {
+    let line = "\(Date()) \(msg)\n"
+    let path = ("~/Library/Logs/ClaudeSessions.log" as NSString).expandingTildeInPath
+    if let h = FileHandle(forWritingAtPath: path) {
+        h.seekToEndOfFile()
+        h.write(line.data(using: .utf8)!)
+        h.closeFile()
+    } else {
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }
 
@@ -180,6 +215,76 @@ final class HostResolver {
     }
 }
 
+// MARK: - Terminal title resolution (iTerm2, by tty)
+
+/// Shows the real terminal-tab title for iTerm2-hosted sessions. Batch-queries
+/// iTerm2 once per 10s cycle (single AppleScript round-trip), maps tty → title,
+/// and matches sessions via their pid's tty. Non-iTerm hosts keep the agents name.
+final class TitleResolver {
+    static let shared = TitleResolver()
+    private var titlesByTty: [String: String] = [:]   // "ttys012" -> tab title
+    private var ttyByPid: [Int: String] = [:]
+    private var lastQuery = Date.distantPast
+    private let queue = DispatchQueue(label: "title-resolver")
+
+    func title(for session: Session) -> String? {
+        guard HostResolver.shared.host(forPid: session.pid) == .iterm else { return nil }
+        var t: String?
+        queue.sync {
+            if let tty = ttyByPid[session.pid] { t = titlesByTty[tty] }
+        }
+        return (t?.isEmpty == false) ? t : nil
+    }
+
+    /// Called from the poll loop (background thread).
+    func refresh(pids: [Int]) {
+        guard Date().timeIntervalSince(lastQuery) > 10 else { return }
+        lastQuery = Date()
+
+        var newTtyByPid: [Int: String] = [:]
+        for pid in pids {
+            if let r = runProcess("/bin/ps", ["-o", "tty=", "-p", "\(pid)"]) {
+                let tty = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !tty.isEmpty, tty != "??" { newTtyByPid[pid] = tty }
+            }
+        }
+
+        // One round-trip: "tty<TAB>title" per line.
+        let script = """
+        tell application "iTerm2"
+            set out to ""
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        set out to out & (tty of s) & tab & (name of s) & linefeed
+                    end repeat
+                end repeat
+            end repeat
+            return out
+        end tell
+        """
+        var newTitles: [String: String] = [:]
+        var err: NSDictionary?
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.googlecode.iterm2" }),
+           let s = NSAppleScript(source: script) {
+            let result = s.executeAndReturnError(&err)
+            if err == nil, let text = result.stringValue {
+                for line in text.split(separator: "\n") {
+                    let parts = line.split(separator: "\t", maxSplits: 1)
+                    guard parts.count == 2 else { continue }
+                    // iTerm reports "/dev/ttys012"; ps reports "ttys012".
+                    let tty = (String(parts[0]) as NSString).lastPathComponent
+                    newTitles[tty] = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                }
+            }
+        }
+        queue.sync {
+            ttyByPid = newTtyByPid
+            if !newTitles.isEmpty { titlesByTty = newTitles }
+        }
+    }
+}
+
 // MARK: - Data source
 
 final class DataSource {
@@ -195,6 +300,7 @@ final class DataSource {
         let liveIds = Set(agents.map { $0.sessionId })
         let livePids = Set(agents.map { $0.pid })
         HostResolver.shared.prune(livePids: livePids)
+        TitleResolver.shared.refresh(pids: agents.map { $0.pid })
 
         // Read status files, delete stale ones, build overlay map.
         let overlay = loadAndReapStatusFiles(liveIds: liveIds)
@@ -308,6 +414,10 @@ final class StatusDot: NSView {
             shape.fillColor = NSColor.clear.cgColor
             shape.strokeColor = NSColor.systemOrange.cgColor
             shape.lineWidth = 2
+        case .error:
+            shape.fillColor = NSColor.systemRed.cgColor
+            shape.strokeColor = NSColor.clear.cgColor
+            shape.lineWidth = 0
         case .idle:
             shape.fillColor = NSColor.systemGray.withAlphaComponent(0.6).cgColor
             shape.strokeColor = NSColor.clear.cgColor
@@ -331,6 +441,7 @@ final class RowView: NSView {
     private let dot = StatusDot(frame: .zero)
     private let nameLabel = NSTextField(labelWithString: "")
     private let projectLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(labelWithString: "")
     private let glyph = NSImageView()
     var onClick: ((RowView) -> Void)?
 
@@ -356,10 +467,15 @@ final class RowView: NSView {
         glyph.contentTintColor = .tertiaryLabelColor
         glyph.imageScaling = .scaleProportionallyDown
         glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        statusLabel.alignment = .right
+        statusLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         addSubview(dot)
         addSubview(nameLabel)
         addSubview(projectLabel)
+        addSubview(statusLabel)
         addSubview(glyph)
 
         NSLayoutConstraint.activate([
@@ -370,9 +486,12 @@ final class RowView: NSView {
             dot.heightAnchor.constraint(equalToConstant: 10),
 
             glyph.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
+            glyph.topAnchor.constraint(equalTo: topAnchor, constant: 6),
             glyph.widthAnchor.constraint(equalToConstant: 16),
             glyph.heightAnchor.constraint(equalToConstant: 16),
+
+            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
 
             nameLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 9),
             nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 5),
@@ -380,7 +499,7 @@ final class RowView: NSView {
 
             projectLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             projectLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 1),
-            projectLabel.trailingAnchor.constraint(lessThanOrEqualTo: glyph.leadingAnchor, constant: -6),
+            projectLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -6),
         ])
 
         update(session: session)
@@ -390,9 +509,11 @@ final class RowView: NSView {
     func update(session: Session) {
         self.session = session
         dot.configure(session.status)
-        nameLabel.stringValue = session.name
+        nameLabel.stringValue = TitleResolver.shared.title(for: session) ?? session.name
         let base = (session.cwd as NSString).lastPathComponent
         projectLabel.stringValue = base.isEmpty ? session.cwd : "— \(base)"
+        statusLabel.stringValue = session.status.label
+        statusLabel.textColor = session.status.color
         let host = HostResolver.shared.host(forPid: session.pid)
         glyph.image = NSImage(systemSymbolName: host.glyphSymbol, accessibilityDescription: nil)
 
@@ -601,10 +722,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
 
         // Header counts.
+        let errors = sorted.filter { $0.status == .error }.count
         let working = sorted.filter { $0.status == .working }.count
         let waiting = sorted.filter { $0.status == .waiting }.count
         let done = sorted.filter { $0.status == .doneUnseen }.count
         var parts: [String] = []
+        if errors > 0 { parts.append("\(errors) error") }
         if working > 0 { parts.append("\(working) working") }
         if waiting > 0 { parts.append("\(waiting) waiting") }
         if done > 0 { parts.append("\(done) done") }
@@ -642,6 +765,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func handleClick(_ row: RowView) {
         let session = row.session
         let host = HostResolver.shared.host(forPid: session.pid)
+        dbg("click session=\(session.name) pid=\(session.pid) host=\(host) hostPid=\(String(describing: HostResolver.shared.hostPid(forPid: session.pid)))")
         focus(host: host, session: session)
 
         if session.status == .doneUnseen {
@@ -683,11 +807,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         case .terminal:
             focusTerminal(session: session)
         case .vscode:
-            raiseWindowOrActivate(processName: "Code", appHint: "Visual Studio Code",
+            raiseWindowOrActivate(processName: "Code", bundlePrefix: "com.microsoft.VSCode",
                                   titleNeedle: (session.cwd as NSString).lastPathComponent,
                                   fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .pycharm:
-            raiseWindowOrActivate(processName: "PyCharm", appHint: "PyCharm",
+            raiseWindowOrActivate(processName: "PyCharm", bundlePrefix: "com.jetbrains.pycharm",
                                   titleNeedle: (session.cwd as NSString).lastPathComponent,
                                   fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .unknown:
@@ -698,8 +822,26 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Try to AXRaise the host-app window whose title contains the project
     /// folder name; regardless of outcome, activate the app. Neither step can
     /// spawn a new window/tab/project.
-    private func raiseWindowOrActivate(processName: String, appHint: String,
+    private func raiseWindowOrActivate(processName: String, bundlePrefix: String,
                                        titleNeedle: String, fallbackPid: Int?) {
+        // Activate via LaunchServices (`open -b`, no arguments) — Dock-click
+        // semantics: brings the app forward AND switches to its Space, opens
+        // nothing when the app already has windows. NSRunningApplication
+        // .activate() from a background app makes the app frontmost without
+        // pulling the user to its Space (cooperative activation).
+        var launched = false
+        for app in NSWorkspace.shared.runningApplications
+        where app.activationPolicy == .regular
+            && app.bundleIdentifier?.hasPrefix(bundlePrefix) == true {
+            let r = runProcess("/usr/bin/open", ["-b", app.bundleIdentifier!])
+            launched = (r?.code == 0)
+            dbg("open -b \(app.bundleIdentifier!) -> \(String(describing: r?.code))")
+            break
+        }
+        if !launched {
+            let ok = activate(pid: fallbackPid)
+            dbg("pid-activate fallback \(String(describing: fallbackPid)) -> \(ok)")
+        }
         let script = """
         tell application "System Events"
             if exists process "\(escapeAS(processName))" then
@@ -715,53 +857,54 @@ final class AppController: NSObject, NSApplicationDelegate {
         end tell
         """
         runAppleScript(script)
-        if let pid = fallbackPid, activate(pid: pid) { return }
-        // Last resort: activate by app name — running apps only, never launches.
-        for app in NSWorkspace.shared.runningApplications
-        where app.localizedName?.contains(appHint) == true {
-            app.activate()
-            return
-        }
     }
 
     @discardableResult
     private func activate(pid: Int?) -> Bool {
+        // The ancestry walk can land on an Electron/JetBrains helper process;
+        // hop from that pid to its .regular app via bundle URL ownership.
         guard let pid = pid,
-              let app = NSRunningApplication(processIdentifier: pid_t(pid)) else { return false }
-        // Walk from the matched process up to the app bundle's own process if
-        // needed (e.g. Electron helper) — NSRunningApplication only exists for
-        // real app processes, so a nil here falls back to name matching.
-        return app.activate()
+              let proc = NSRunningApplication(processIdentifier: pid_t(pid)) else { return false }
+        if proc.activationPolicy == .regular { return proc.activate() }
+        if let bid = proc.bundleIdentifier {
+            for app in NSWorkspace.shared.runningApplications
+            where app.activationPolicy == .regular && app.bundleIdentifier == bid {
+                return app.activate()
+            }
+        }
+        return false
     }
 
     private func focusITerm(session: Session) {
-        let cwd = session.cwd
-        let name = session.name
+        // Match the session by its tty — reliable without iTerm2 shell
+        // integration. ps gives e.g. "ttys012"; iTerm reports "/dev/ttys012".
+        guard let r = runProcess("/bin/ps", ["-o", "tty=", "-p", "\(session.pid)"]),
+              case let tty = r.out.trimmingCharacters(in: .whitespacesAndNewlines),
+              !tty.isEmpty, tty != "??" else {
+            dbg("iterm: no tty for pid \(session.pid); activating only")
+            _ = runProcess("/usr/bin/open", ["-b", "com.googlecode.iterm2"])
+            return
+        }
         let script = """
         tell application "iTerm2"
-            activate
+            set matched to false
             repeat with w in windows
                 repeat with t in tabs of w
                     repeat with s in sessions of t
-                        set p to ""
-                        try
-                            set p to (variable s named "session.path")
-                        end try
-                        if p is equal to "\(escapeAS(cwd))" then
+                        if tty of s ends with "\(escapeAS(tty))" then
                             select w
                             select t
-                            return
+                            select s
+                            set matched to true
+                            exit repeat
                         end if
-                        try
-                            if name of s contains "\(escapeAS(name))" then
-                                select w
-                                select t
-                                return
-                            end if
-                        end try
                     end repeat
+                    if matched then exit repeat
                 end repeat
+                if matched then exit repeat
             end repeat
+            activate
+            return matched
         end tell
         """
         runAppleScript(script)
@@ -796,7 +939,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             var err: NSDictionary?
             if let script = NSAppleScript(source: source) {
-                script.executeAndReturnError(&err)
+                let result = script.executeAndReturnError(&err)
+                if let err = err {
+                    dbg("applescript error: \(err)")
+                } else {
+                    dbg("applescript ok result=\(result.stringValue ?? result.description)")
+                }
             }
         }
     }

@@ -62,6 +62,9 @@ case "$EVENT" in
       write_status "done_unseen"
     fi
     ;;
+  StopFailure)
+    write_status "error"
+    ;;
   SessionEnd)
     rm -f "$FILE" 2>/dev/null || true
     ;;

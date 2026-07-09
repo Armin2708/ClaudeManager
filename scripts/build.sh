@@ -18,6 +18,13 @@ mkdir -p "$APP_DIR/Contents/Resources"
 echo "==> Compiling $SRC"
 swiftc -O "$SRC" -o "$BIN"
 
+# Icon (generate once; reuse committed asset afterwards)
+ICON="$REPO_DIR/assets/ClaudeSessions.icns"
+if [ ! -f "$ICON" ]; then
+  bash "$SCRIPT_DIR/make-icon.sh"
+fi
+cp "$ICON" "$APP_DIR/Contents/Resources/ClaudeSessions.icns"
+
 echo "==> Writing Info.plist"
 cat > "$PLIST" <<'PLIST_EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -46,6 +53,8 @@ cat > "$PLIST" <<'PLIST_EOF'
 	<string>Focuses the terminal tab running a Claude Code session.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CFBundleIconFile</key>
+	<string>ClaudeSessions</string>
 </dict>
 </plist>
 PLIST_EOF
