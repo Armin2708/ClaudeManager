@@ -473,6 +473,85 @@ final class DataSource {
     }
 }
 
+// MARK: - Claude theme
+
+enum Theme {
+    /// Claude coral — the brand accent.
+    static let coral = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1)   // #D97757
+    /// Warm dark surface (Claude dark mode) / warm cream (light mode).
+    static var surfaceTint: NSColor {
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark
+            ? NSColor(srgbRed: 0.149, green: 0.149, blue: 0.141, alpha: 0.55)          // #262624
+            : NSColor(srgbRed: 0.941, green: 0.933, blue: 0.902, alpha: 0.45)          // #F0EEE6
+    }
+    /// Anthropic faces when installed; graceful system fallback otherwise.
+    static func display(_ size: CGFloat, _ weight: NSFont.Weight) -> NSFont {
+        let styreneName = weight.rawValue >= NSFont.Weight.semibold.rawValue
+            ? "Styrene A Medium" : "Styrene A Regular"
+        return NSFont(name: styreneName, size: size)
+            ?? NSFont(name: "StyreneA-Medium", size: size)
+            ?? NSFont.systemFont(ofSize: size, weight: weight)
+    }
+}
+
+// MARK: - Claude starburst mark (drawn, no assets)
+
+final class ClaudeMark: NSView {
+    private let rays = CAShapeLayer()
+
+    var spinning = false {
+        didSet {
+            guard spinning != oldValue else { return }
+            rays.removeAnimation(forKey: "spin")
+            if spinning {
+                let a = CABasicAnimation(keyPath: "transform.rotation.z")
+                a.fromValue = 0
+                a.toValue = -2 * Double.pi
+                a.duration = 3.5
+                a.repeatCount = .infinity
+                rays.add(a, forKey: "spin")
+            }
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(rays)
+        rebuild()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        rebuild()
+    }
+
+    private func rebuild() {
+        guard bounds.width > 0 else { return }
+        let R = min(bounds.width, bounds.height) / 2
+        let path = CGMutablePath()
+        let c = CGPoint(x: 0, y: 0) // rays layer is positioned at view center
+        // Claude's mark: a hand-drawn starburst — 12 rays of varied length.
+        let lengths: [CGFloat] = [1.0, 0.72, 0.9, 0.68, 0.97, 0.7, 1.0, 0.72, 0.9, 0.68, 0.97, 0.7]
+        for i in 0..<12 {
+            let angle = CGFloat(i) * .pi / 6 + .pi / 12
+            let r = R * lengths[i]
+            path.move(to: c)
+            path.addLine(to: CGPoint(x: c.x + cos(angle) * r, y: c.y + sin(angle) * r))
+        }
+        rays.path = path
+        rays.strokeColor = Theme.coral.cgColor
+        rays.fillColor = nil
+        rays.lineWidth = max(1.6, R * 0.16)
+        rays.lineCap = .round
+        // Zero-sized bounds centered on the view: rotation spins in place.
+        rays.bounds = .zero
+        rays.position = CGPoint(x: bounds.midX, y: bounds.midY)
+    }
+}
+
 // MARK: - Status edge bar (the panel's signature: a scannable color column)
 
 final class StatusBar: NSView {
@@ -589,7 +668,7 @@ final class RowView: NSView {
             ? session.name
             : (TitleResolver.shared.title(for: session) ?? session.name)
         nameLabel.stringValue = title
-        nameLabel.font = NSFont.systemFont(ofSize: isChild ? 11 : 13, weight: isChild ? .medium : .semibold)
+        nameLabel.font = Theme.display(isChild ? 11 : 13, isChild ? .medium : .semibold)
         nameLabel.textColor = isChild ? .secondaryLabelColor : .labelColor
         // Children show what they are instead of the repo path; parents show
         // the home-relative path in mono.
@@ -656,6 +735,10 @@ final class ContentView: NSView {
             NSMenu.popUpContextMenu(m, with: event, for: self)
         }
     }
+    override func mouseDown(with event: NSEvent) {
+        controller?.contentClicked()
+        super.mouseDown(with: event)
+    }
 }
 
 // MARK: - App controller
@@ -663,9 +746,12 @@ final class ContentView: NSView {
 final class AppController: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private var effectView: NSVisualEffectView!
+    private var tintView: NSView!
     private var content: ContentView!
+    private var headerMark: ClaudeMark!
     private var headerLabel: NSTextField!
     private var headerCounts: NSTextField!
+    private var collapseButton: NSButton!
     private var footerLabel: NSTextField!
     private var rowsStack: NSStackView!
     private var timer: Timer?
@@ -675,16 +761,97 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var paused = false
     private var lastReachable = true
     private var lastSessions: [Session] = []
+    private var hadFirstData = false
+
+    // Island (collapsed) mode — a small capsule docked beside the notch.
+    private(set) var isCollapsed = UserDefaults.standard.bool(forKey: "IslandCollapsed")
+    // Constraints that only apply expanded (they force a tall minimum height).
+    private var expandedConstraints: [NSLayoutConstraint] = []
 
     private let panelWidth: CGFloat = 280
+    private let islandHeight: CGFloat = 34
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         buildPanel()
+        headerMark.spinning = true  // loading until first data arrives
+        if isCollapsed { applyIslandLayout() }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+    }
+
+    // MARK: Island (collapse) mode
+
+    @objc func toggleIsland() {
+        isCollapsed.toggle()
+        UserDefaults.standard.set(isCollapsed, forKey: "IslandCollapsed")
+        if isCollapsed {
+            UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: "ExpandedFrame")
+            applyIslandLayout()
+        } else {
+            applyExpandedLayout()
+        }
+    }
+
+    func contentClicked() {
+        if isCollapsed { toggleIsland() }
+    }
+
+    private func applyIslandLayout() {
+        rowsStack.isHidden = true
+        footerLabel.isHidden = true
+        collapseButton.isHidden = true
+        headerLabel.attributedStringValue = NSAttributedString(string: "")
+        panel.level = .statusBar
+        panel.alphaValue = 1  // the pill never dims
+        effectView.layer?.cornerRadius = islandHeight / 2
+        NSLayoutConstraint.deactivate(expandedConstraints)
+        render(sessions: lastSessions)  // strips rows so the small frame can apply
+        positionIsland()
+    }
+
+    private func positionIsland() {
+        // Always target the built-in notched display (safe-area top inset > 0);
+        // NSScreen.main follows keyboard focus and wanders across monitors.
+        let notched = NSScreen.screens.first { screen in
+            if #available(macOS 12.0, *) { return screen.safeAreaInsets.top > 0 }
+            return false
+        }
+        guard let screen = notched ?? NSScreen.main else { return }
+        dbg("island screen=\(screen.localizedName) frame=\(screen.frame) visMaxY=\(screen.visibleFrame.maxY)")
+        // 14 lead + 13 mark + 7 gap + counts + 8 + ~12 hidden button + 13 trail
+        let w = 34 + headerCounts.intrinsicContentSize.width + 42
+        // Top-center, tucked just under the notch/menu bar (the notch itself
+        // is dead pixels — a window centered inside it would be invisible).
+        let x = screen.frame.midX - w / 2
+        let y = screen.visibleFrame.maxY - islandHeight + 6
+        panel.setFrame(NSRect(x: x, y: y, width: w, height: islandHeight),
+                       display: true, animate: false)
+        dbg("island setFrame=\(panel.frame) visible=\(panel.isVisible) collapsed=\(isCollapsed)")
+    }
+
+    private func applyExpandedLayout() {
+        rowsStack.isHidden = false
+        collapseButton.isHidden = false
+        footerLabel.isHidden = lastReachable
+        headerLabel.attributedStringValue = NSAttributedString(
+            string: "SESSIONS",
+            attributes: [
+                .font: Theme.display(9, .heavy),
+                .kern: 1.5,
+                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
+            ])
+        panel.level = .floating
+        effectView.layer?.cornerRadius = 14
+        NSLayoutConstraint.activate(expandedConstraints)
+        if let s = UserDefaults.standard.string(forKey: "ExpandedFrame") {
+            panel.setFrame(NSRectFromString(s), display: true, animate: false)
+        } else {
+            positionTopRight()
+        }
+        render(sessions: lastSessions)
     }
 
     // MARK: Panel construction
@@ -713,24 +880,42 @@ final class AppController: NSObject, NSApplicationDelegate {
         effectView.layer?.masksToBounds = true
         effectView.autoresizingMask = [.width, .height]
 
+        // Warm Claude surface tint over the vibrancy material.
+        tintView = NSView(frame: initialRect)
+        tintView.wantsLayer = true
+        tintView.layer?.backgroundColor = Theme.surfaceTint.cgColor
+        tintView.autoresizingMask = [.width, .height]
+        effectView.addSubview(tintView)
+
         content = ContentView(frame: initialRect)
         content.controller = self
         content.autoresizingMask = [.width, .height]
         effectView.addSubview(content)
 
+        headerMark = ClaudeMark(frame: .zero)
+        headerMark.translatesAutoresizingMaskIntoConstraints = false
+
         headerLabel = NSTextField(labelWithString: "")
         headerLabel.attributedStringValue = NSAttributedString(
             string: "SESSIONS",
             attributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .heavy),
+                .font: Theme.display(9, .heavy),
                 .kern: 1.5,
-                .foregroundColor: NSColor.tertiaryLabelColor,
+                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
             ])
         headerLabel.translatesAutoresizingMaskIntoConstraints = false
 
         headerCounts = NSTextField(labelWithString: "")
         headerCounts.alignment = .right
         headerCounts.translatesAutoresizingMaskIntoConstraints = false
+
+        collapseButton = NSButton(image: NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left",
+                                                 accessibilityDescription: "Collapse")!,
+                                  target: self, action: #selector(toggleIsland))
+        collapseButton.isBordered = false
+        collapseButton.contentTintColor = .tertiaryLabelColor
+        collapseButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
+        collapseButton.translatesAutoresizingMaskIntoConstraints = false
 
         rowsStack = NSStackView()
         rowsStack.orientation = .vertical
@@ -745,27 +930,42 @@ final class AppController: NSObject, NSApplicationDelegate {
         footerLabel.translatesAutoresizingMaskIntoConstraints = false
         footerLabel.isHidden = true
 
+        content.addSubview(headerMark)
         content.addSubview(headerLabel)
         content.addSubview(headerCounts)
+        content.addSubview(collapseButton)
         content.addSubview(rowsStack)
         content.addSubview(footerLabel)
 
         NSLayoutConstraint.activate([
-            headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
-            headerLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 15),
+            headerMark.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            headerMark.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+            headerMark.widthAnchor.constraint(equalToConstant: 13),
+            headerMark.heightAnchor.constraint(equalToConstant: 13),
 
-            headerCounts.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -15),
+            headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            headerLabel.leadingAnchor.constraint(equalTo: headerMark.trailingAnchor, constant: 7),
+
+            collapseButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -13),
+            collapseButton.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+
+            headerCounts.trailingAnchor.constraint(equalTo: collapseButton.leadingAnchor, constant: -8),
             headerCounts.firstBaselineAnchor.constraint(equalTo: headerLabel.firstBaselineAnchor),
             headerCounts.leadingAnchor.constraint(greaterThanOrEqualTo: headerLabel.trailingAnchor, constant: 8),
 
-            rowsStack.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 8),
             rowsStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 6),
             rowsStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -6),
 
-            footerLabel.topAnchor.constraint(equalTo: rowsStack.bottomAnchor, constant: 6),
             footerLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
-            footerLabel.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -8),
         ])
+
+        // These force a tall minimum window height — deactivated in island mode.
+        expandedConstraints = [
+            rowsStack.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 8),
+            footerLabel.topAnchor.constraint(equalTo: rowsStack.bottomAnchor, constant: 6),
+            footerLabel.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -8),
+        ]
+        if !isCollapsed { NSLayoutConstraint.activate(expandedConstraints) }
 
         panel.contentView = effectView
         panel.setFrameAutosaveName("ClaudeSessionsPanel")
@@ -799,13 +999,17 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func apply(_ result: DataSource.Result) {
         lastReachable = result.reachable
         if result.reachable {
+            hadFirstData = true
             lastSessions = result.sessions
             footerLabel.isHidden = true
         } else {
             // Keep last rows; show footer.
             footerLabel.stringValue = "daemon unreachable"
-            footerLabel.isHidden = false
+            footerLabel.isHidden = isCollapsed
         }
+        // The mark spins while loading or when the daemon is unreachable.
+        headerMark.spinning = !hadFirstData || !result.reachable
+        tintView.layer?.backgroundColor = Theme.surfaceTint.cgColor
         render(sessions: lastSessions)
     }
 
@@ -827,6 +1031,20 @@ final class AppController: NSObject, NSApplicationDelegate {
         for parent in topLevel.sorted(by: byStatus) {
             sorted.append(parent)
             sorted.append(contentsOf: (childrenOf[parent.sessionId] ?? []).sorted(by: byStatus))
+        }
+
+        // Island mode: no rows in the hierarchy at all — their (even hidden)
+        // constraints would force a minimum window size and block the small
+        // island frame. Counts still update below via the header summary.
+        if isCollapsed {
+            for v in rowsStack.arrangedSubviews {
+                rowsStack.removeArrangedSubview(v)
+                v.removeFromSuperview()
+            }
+            rowViews.removeAll()
+            updateHeaderCounts(sorted: sorted)
+            positionIsland()
+            return
         }
 
         // Diff rows by sessionId to preserve pulse animation continuity.
@@ -860,6 +1078,22 @@ final class AppController: NSObject, NSApplicationDelegate {
             v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
         }
 
+        updateHeaderCounts(sorted: sorted)
+
+        resizePanel(rows: sorted)
+
+        // All-idle → dim (never in island mode — the pill stays readable).
+        let anyActive = sorted.contains { $0.status != .idle }
+        let target: CGFloat = anyActive ? 1.0 : 0.3
+        if abs(panel.alphaValue - target) > 0.01 {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.4
+                panel.animator().alphaValue = target
+            }
+        }
+    }
+
+    private func updateHeaderCounts(sorted: [Session]) {
         // Header counts real sessions only (synthetic children excluded):
         // colored "● n" pairs, one per active status, quiet text when idle.
         let real = sorted.filter { $0.childGlyph == nil }
@@ -891,18 +1125,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             ]))
         }
         headerCounts.attributedStringValue = summary
-
-        resizePanel(rows: sorted)
-
-        // All-idle → dim.
-        let anyActive = sorted.contains { $0.status != .idle }
-        let target: CGFloat = anyActive ? 1.0 : 0.3
-        if abs(panel.alphaValue - target) > 0.01 {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.4
-                panel.animator().alphaValue = target
-            }
-        }
     }
 
     private func resizePanel(rows: [Session]) {
@@ -1114,6 +1336,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
+
+        let islandItem = NSMenuItem(title: isCollapsed ? "Expand panel" : "Collapse to island",
+                                    action: #selector(toggleIsland), keyEquivalent: "")
+        islandItem.target = self
+        menu.addItem(islandItem)
 
         let pauseItem = NSMenuItem(title: paused ? "Resume updates" : "Pause updates",
                                    action: #selector(togglePause), keyEquivalent: "")
