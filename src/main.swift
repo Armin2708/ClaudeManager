@@ -1292,8 +1292,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         updateHeaderCounts(sorted: sorted)
 
         positionExpanded(rows: sorted, animate: false)
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, let row = self.rowsStack.arrangedSubviews.first else { return }
     }
 
     private func updateHeaderCounts(sorted: [Session]) {
