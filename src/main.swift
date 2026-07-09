@@ -279,7 +279,7 @@ final class TitleResolver {
             repeat with w in windows
                 repeat with t in tabs of w
                     repeat with s in sessions of t
-                        set out to out & (tty of s) & tab & (name of s) & linefeed
+                        set out to out & (tty of s) & (character id 9) & (name of s) & linefeed
                     end repeat
                 end repeat
             end repeat
@@ -291,7 +291,9 @@ final class TitleResolver {
         if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.googlecode.iterm2" }),
            let s = NSAppleScript(source: script) {
             let result = s.executeAndReturnError(&err)
+            if let err = err { dbg("title query error: \(err)") }
             if err == nil, let text = result.stringValue {
+                dbg("title query ok: \(text.split(separator: "\n").count) sessions")
                 for line in text.split(separator: "\n") {
                     let parts = line.split(separator: "\t", maxSplits: 1)
                     guard parts.count == 2 else { continue }
@@ -305,6 +307,7 @@ final class TitleResolver {
             ttyByPid = newTtyByPid
             if !newTitles.isEmpty { titlesByTty = newTitles }
         }
+        dbg("titles map=\(newTitles) ttyByPid=\(newTtyByPid)")
     }
 
     /// iTerm session names arrive as "⠂ Actual Title (node)": a braille
