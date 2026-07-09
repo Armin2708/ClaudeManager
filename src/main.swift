@@ -135,20 +135,28 @@ final class ClaudeLocator {
 
 final class HostResolver {
     static let shared = HostResolver()
-    private var cache: [Int: HostApp] = [:]
+    private var cache: [Int: (host: HostApp, hostPid: Int?)] = [:]
 
     func host(forPid pid: Int) -> HostApp {
+        return resolve(pid).host
+    }
+
+    func hostPid(forPid pid: Int) -> Int? {
+        return resolve(pid).hostPid
+    }
+
+    private func resolve(_ pid: Int) -> (host: HostApp, hostPid: Int?) {
         if let cached = cache[pid] { return cached }
         var current = pid
-        var result: HostApp = .unknown
+        var result: (host: HostApp, hostPid: Int?) = (.unknown, nil)
         for _ in 0..<16 {
             guard current > 1, let info = procInfo(current) else { break }
             let comm = (info.comm as NSString).lastPathComponent.lowercased()
-            if comm.contains("iterm") { result = .iterm; break }
-            if comm.contains("pycharm") || comm.contains("jetbrains") { result = .pycharm; break }
-            if comm.contains("code") || comm.contains("electron") { result = .vscode; break }
-            if comm == "terminal" { result = .terminal; break }
-            if info.ppid <= 1 { break }
+            if comm.contains("iterm") { result = (.iterm, current); break }
+            if comm.contains("pycharm") || comm.contains("jetbrains") { result = (.pycharm, current); break }
+            if comm.contains("code") || comm.contains("electron") { result = (.vscode, current); break }
+            if comm == "terminal" { result = (.terminal, current); break }
+            if info.ppid <= 1 { result = (.unknown, current); break }
             current = info.ppid
         }
         cache[pid] = result
@@ -663,6 +671,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Focus must NEVER create windows/tabs/projects. Strategy per host:
+    // 1. Raise the existing window whose title matches the project (System
+    //    Events AXRaise — precise, needs one-time Accessibility grant).
+    // 2. Fallback: activate the host app process we found via ancestry —
+    //    activation alone can't open anything.
     private func focus(host: HostApp, session: Session) {
         switch host {
         case .iterm:
@@ -670,12 +683,55 @@ final class AppController: NSObject, NSApplicationDelegate {
         case .terminal:
             focusTerminal(session: session)
         case .vscode:
-            _ = runProcess("/usr/bin/open", ["-a", "Visual Studio Code", session.cwd])
+            raiseWindowOrActivate(processName: "Code", appHint: "Visual Studio Code",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .pycharm:
-            _ = runProcess("/usr/bin/open", ["-a", "PyCharm", session.cwd])
+            raiseWindowOrActivate(processName: "PyCharm", appHint: "PyCharm",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .unknown:
-            _ = runProcess("/usr/bin/open", ["-a", "iTerm", session.cwd]) // best-effort; falls through if absent
+            activate(pid: HostResolver.shared.hostPid(forPid: session.pid))
         }
+    }
+
+    /// Try to AXRaise the host-app window whose title contains the project
+    /// folder name; regardless of outcome, activate the app. Neither step can
+    /// spawn a new window/tab/project.
+    private func raiseWindowOrActivate(processName: String, appHint: String,
+                                       titleNeedle: String, fallbackPid: Int?) {
+        let script = """
+        tell application "System Events"
+            if exists process "\(escapeAS(processName))" then
+                tell process "\(escapeAS(processName))"
+                    repeat with w in windows
+                        if name of w contains "\(escapeAS(titleNeedle))" then
+                            perform action "AXRaise" of w
+                            exit repeat
+                        end if
+                    end repeat
+                end tell
+            end if
+        end tell
+        """
+        runAppleScript(script)
+        if let pid = fallbackPid, activate(pid: pid) { return }
+        // Last resort: activate by app name — running apps only, never launches.
+        for app in NSWorkspace.shared.runningApplications
+        where app.localizedName?.contains(appHint) == true {
+            app.activate()
+            return
+        }
+    }
+
+    @discardableResult
+    private func activate(pid: Int?) -> Bool {
+        guard let pid = pid,
+              let app = NSRunningApplication(processIdentifier: pid_t(pid)) else { return false }
+        // Walk from the matched process up to the app bundle's own process if
+        // needed (e.g. Electron helper) — NSRunningApplication only exists for
+        // real app processes, so a nil here falls back to name matching.
+        return app.activate()
     }
 
     private func focusITerm(session: Session) {
