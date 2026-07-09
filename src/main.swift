@@ -943,14 +943,16 @@ final class AppController: NSObject, NSApplicationDelegate {
             let tr: CGFloat = 8    // top flare radius
             let br: CGFloat = bottomRadius
             p = CGMutablePath()
+            // Top-left: full width at the very top edge, boundary curving
+            // inward (control on the vertical) — the outward flare.
             p.move(to: CGPoint(x: 0, y: h))
-            p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: tr, y: h))
+            p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: 0, y: h - tr))
             p.addLine(to: CGPoint(x: tr, y: br))
             p.addQuadCurve(to: CGPoint(x: tr + br, y: 0), control: CGPoint(x: tr, y: 0))
             p.addLine(to: CGPoint(x: w - tr - br, y: 0))
             p.addQuadCurve(to: CGPoint(x: w - tr, y: br), control: CGPoint(x: w - tr, y: 0))
             p.addLine(to: CGPoint(x: w - tr, y: h - tr))
-            p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - tr, y: h))
+            p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w, y: h - tr))
             p.closeSubpath()
         }
         if animated, let old = islandMask.path {
