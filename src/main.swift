@@ -885,12 +885,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         let notch = notchMetrics(on: screen)
         let topInset: CGFloat = isDetached ? 4 : notch.height + 6
         headerTop.constant = topInset
-        let headerH: CGFloat = 14 + 8
-        let rowsH = rows.reduce(CGFloat(0)) { $0 + ($1.parentId != nil ? 36 : 46) }
-            + CGFloat(max(rows.count - 1, 0)) * 3
-        let footerH: CGFloat = footerLabel.isHidden ? 0 : 18
-        let h = max(topInset + headerH + rowsH + footerH + 12,
-                    isDetached ? 64 : notch.height + 44)
+        // Ask Auto Layout for the exact minimum height — a hand-computed
+        // number that undershoots gets silently clamped by constraints while
+        // the mask uses the smaller value, leaving a transparent strip.
+        content.layoutSubtreeIfNeeded()
+        let h = max(content.fittingSize.height, isDetached ? 64 : notch.height + 44)
         if isDetached {
             // Keep the user's placement; grow/shrink from the top edge.
             let f = panel.frame
@@ -940,19 +939,16 @@ final class AppController: NSObject, NSApplicationDelegate {
             p.addRoundedRect(in: CGRect(x: 0, y: 0, width: w, height: h),
                              cornerWidth: 14, cornerHeight: 14)
         } else {
-            let tr: CGFloat = 8    // top flare radius
+            // Straight top corners flush with the screen edge; only the
+            // bottom corners are rounded.
             let br: CGFloat = bottomRadius
             p = CGMutablePath()
-            // Top-left: full width at the very top edge, boundary curving
-            // inward (control on the vertical) — the outward flare.
             p.move(to: CGPoint(x: 0, y: h))
-            p.addQuadCurve(to: CGPoint(x: tr, y: h - tr), control: CGPoint(x: 0, y: h - tr))
-            p.addLine(to: CGPoint(x: tr, y: br))
-            p.addQuadCurve(to: CGPoint(x: tr + br, y: 0), control: CGPoint(x: tr, y: 0))
-            p.addLine(to: CGPoint(x: w - tr - br, y: 0))
-            p.addQuadCurve(to: CGPoint(x: w - tr, y: br), control: CGPoint(x: w - tr, y: 0))
-            p.addLine(to: CGPoint(x: w - tr, y: h - tr))
-            p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w, y: h - tr))
+            p.addLine(to: CGPoint(x: 0, y: br))
+            p.addQuadCurve(to: CGPoint(x: br, y: 0), control: CGPoint(x: 0, y: 0))
+            p.addLine(to: CGPoint(x: w - br, y: 0))
+            p.addQuadCurve(to: CGPoint(x: w, y: br), control: CGPoint(x: w, y: 0))
+            p.addLine(to: CGPoint(x: w, y: h))
             p.closeSubpath()
         }
         if animated, let old = islandMask.path {
@@ -1298,8 +1294,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         positionExpanded(rows: sorted, animate: false)
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let row = self.rowsStack.arrangedSubviews.first else { return }
-            dbg("dbg frames: panel=\(self.panel.frame.size) content=\(self.content.frame.size) effect=\(self.effectView.frame.size) row=\(row.frame) stack=\(self.rowsStack.frame)")
-        }
     }
 
     private func updateHeaderCounts(sorted: [Session]) {
