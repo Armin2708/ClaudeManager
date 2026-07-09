@@ -70,7 +70,11 @@ case "$EVENT" in
     # background tasks are published as children for the panel to nest.
     RUNNING_TASKS=$(echo "$INPUT" | jq -r '[(.background_tasks // [])[] | select(.status == "running")] | length' 2>/dev/null || echo 0)
     PENDING_CRONS=$(echo "$INPUT" | jq -r '(.session_crons // []) | length' 2>/dev/null || echo 0)
-    TASK_CHILDREN=$(echo "$INPUT" | jq -c '[(.background_tasks // [])[] | select(.status == "running") | {id: (.id // "task"), kind: (.type // "task"), name: (.description // .command // .type // "background task")}]' 2>/dev/null || echo "[]")
+    # Teammate/agent tasks are excluded here: agents are tracked by the
+    # SubagentStart/SubagentStop lifecycle (which knows their given name);
+    # a lingering idle teammate would only duplicate them with a prompt
+    # snippet as its name.
+    TASK_CHILDREN=$(echo "$INPUT" | jq -c '[(.background_tasks // [])[] | select(.status == "running") | select((.type // "") | test("teammate|agent") | not) | {id: (.id // "task"), kind: (.type // "task"), name: (.description // .command // .type // "background task")}]' 2>/dev/null || echo "[]")
     if [ "${RUNNING_TASKS:-0}" -gt 0 ] || [ "${PENDING_CRONS:-0}" -gt 0 ]; then
       update_file '.status = "working"
          | .children = ((.children // []) | map(select(.kind == "agent"))) + $tasks' \
