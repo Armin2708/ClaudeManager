@@ -608,6 +608,9 @@ final class RowView: NSView {
 
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.maximumNumberOfLines = 1
+        // Titles truncate rather than dictate the window's minimum width.
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        projectLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         // Repo path in monospace — the terminal's own vernacular.
         projectLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         projectLabel.textColor = .tertiaryLabelColor
@@ -735,24 +738,8 @@ final class ContentView: NSView {
             NSMenu.popUpContextMenu(m, with: event, for: self)
         }
     }
-    private var downAt: NSPoint = .zero
-    private var dragging = false
-
-    override func mouseDown(with event: NSEvent) {
-        downAt = event.locationInWindow
-        dragging = false
-    }
-    override func mouseDragged(with event: NSEvent) {
-        guard controller?.isCollapsed == true, !dragging else { return }
-        let p = event.locationInWindow
-        if hypot(p.x - downAt.x, p.y - downAt.y) > 10 {
-            dragging = true
-            controller?.expandFromDrag(with: event)
-        }
-    }
     override func mouseUp(with event: NSEvent) {
-        if !dragging { controller?.contentClicked() }
-        dragging = false
+        controller?.contentClicked()
     }
 }
 
@@ -772,6 +759,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var islandCounts: NSTextField!
     private var islandMarkX: NSLayoutConstraint!
     private var islandCountsX: NSLayoutConstraint!
+    private var headerTop: NSLayoutConstraint!
     private var footerLabel: NSTextField!
     private var rowsStack: NSStackView!
     private var timer: Timer?
@@ -810,7 +798,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         isCollapsed.toggle()
         UserDefaults.standard.set(isCollapsed, forKey: "IslandCollapsed")
         if isCollapsed {
-            UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: "ExpandedFrame")
             applyIslandLayout(animate: true)
         } else {
             applyExpandedLayout(animate: true)
@@ -847,23 +834,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         headerMark.isHidden = true
         headerCounts.isHidden = true
         headerLabel.attributedStringValue = NSAttributedString(string: "")
-        islandMark.isHidden = false
-        islandCounts.isHidden = false
-        // Seamless with the hardware (per the DynamicNotchKit recipe): pure
-        // black, flush to the top edge, no shadow, screen-saver level,
-        // stationary across Space transitions, and Apple's notch silhouette —
-        // top corners flare outward into the bezel, bottom corners convex.
-        panel.appearance = NSAppearance(named: .darkAqua)
-        tintView.layer?.backgroundColor = NSColor.black.cgColor
-        effectView.layer?.cornerRadius = 0
-        panel.hasShadow = false
-        panel.level = .screenSaver
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        panel.alphaValue = 1  // the notch never dims
-        panel.isMovableByWindowBackground = false  // drags pull it out instead
         NSLayoutConstraint.deactivate(expandedConstraints)
         render(sessions: lastSessions)  // strips rows so the small frame can apply
+        // Slide up into the notch, then reveal the wing content.
+        islandMark.isHidden = true
+        islandCounts.isHidden = true
         positionIsland(animate: animate)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (animate ? 0.28 : 0)) { [weak self] in
+            guard let self = self, self.isCollapsed else { return }
+            self.islandMark.isHidden = false
+            self.islandCounts.isHidden = false
+        }
     }
 
     private func positionIsland(animate: Bool = false) {
@@ -877,20 +858,53 @@ final class AppController: NSObject, NSApplicationDelegate {
         let y = screen.frame.maxY - h
         islandMarkX.constant = wing / 2
         islandCountsX.constant = -wing / 2
-        let target = NSRect(x: x, y: y, width: w, height: h)
-        if abs(panel.frame.minX - target.minX) > 0.5 || abs(panel.frame.minY - target.minY) > 0.5
-            || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5 {
-            panel.setFrame(target, display: true, animate: animate)
+        setFrameKeepingMask(NSRect(x: x, y: y, width: w, height: h),
+                            animate: animate, bottomRadius: 13)
+    }
+
+    /// The expanded panel hangs from the notch: flush to the top edge,
+    /// centered on the notch, same silhouette — part of the notch UI.
+    private func positionExpanded(rows: [Session], animate: Bool = false) {
+        guard let screen = notchScreen else { return }
+        let notch = notchMetrics(on: screen)
+        headerTop.constant = notch.height + 6
+        let headerH: CGFloat = 14 + 8
+        let rowsH = rows.reduce(CGFloat(0)) { $0 + ($1.parentId != nil ? 36 : 46) }
+            + CGFloat(max(rows.count - 1, 0)) * 3
+        let footerH: CGFloat = footerLabel.isHidden ? 0 : 18
+        let h = notch.height + 6 + headerH + rowsH + footerH + 12
+        let w = max(panelWidth + 60, notch.width + 60)
+        let x = screen.frame.midX - w / 2
+        let y = screen.frame.maxY - h
+        setFrameKeepingMask(NSRect(x: x, y: y, width: w, height: max(h, notch.height + 44)),
+                            animate: animate, bottomRadius: 20)
+    }
+
+    private func setFrameKeepingMask(_ target: NSRect, animate: Bool, bottomRadius: CGFloat) {
+        let changed = abs(panel.frame.minX - target.minX) > 0.5 || abs(panel.frame.minY - target.minY) > 0.5
+            || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5
+        if changed {
+            if animate {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    // MediaMate-style feel: fast out of the notch, silky settle.
+                    ctx.duration = 0.42
+                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+                    ctx.allowsImplicitAnimation = true
+                    panel.animator().setFrame(target, display: true)
+                }
+            } else {
+                panel.setFrame(target, display: true)
+            }
         }
-        applyNotchMask(size: target.size)
+        applyNotchMask(size: target.size, bottomRadius: bottomRadius)
     }
 
     /// Apple's notch silhouette (DynamicNotchKit's NotchShape, in layer
     /// coordinates): top corners flare OUTWARD into the bezel, bottom corners
     /// are convex. This is what makes it read as hardware.
-    private func applyNotchMask(size: CGSize) {
+    private func applyNotchMask(size: CGSize, bottomRadius: CGFloat) {
         let tr: CGFloat = 8    // top flare radius
-        let br: CGFloat = 13   // bottom corner radius
+        let br: CGFloat = bottomRadius
         let w = size.width, h = size.height
         let p = CGMutablePath()
         p.move(to: CGPoint(x: 0, y: h))
@@ -907,80 +921,40 @@ final class AppController: NSObject, NSApplicationDelegate {
         effectView.layer?.mask = islandMask
     }
 
-    private func applyExpandedLayout(frameOverride: NSRect? = nil, animate: Bool = false) {
-        rowsStack.isHidden = false
-        collapseButton.isHidden = false
-        footerLabel.isHidden = lastReachable
-        headerMark.isHidden = false
-        headerCounts.isHidden = false
+    private func applyExpandedLayout(animate: Bool = false) {
         islandMark.isHidden = true
         islandCounts.isHidden = true
-        headerLabel.attributedStringValue = NSAttributedString(
-            string: "SESSIONS",
-            attributes: [
-                .font: Theme.display(9, .heavy),
-                .kern: 1.5,
-                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
-            ])
-        panel.appearance = nil
-        tintView.layer?.backgroundColor = Theme.surfaceTint.cgColor
-        effectView.layer?.mask = nil
-        effectView.layer?.cornerRadius = 14
-        panel.hasShadow = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.isMovableByWindowBackground = true
-        NSLayoutConstraint.activate(expandedConstraints)
-        if let f = frameOverride {
-            panel.setFrame(f, display: true, animate: animate)
-        } else if let s = UserDefaults.standard.string(forKey: "ExpandedFrame") {
-            panel.setFrame(NSRectFromString(s), display: true, animate: animate)
-        } else {
-            positionTopRight()
-        }
-        render(sessions: lastSessions)
-    }
-
-    // MARK: Drag out of / into the notch
-
-    /// Drag begun on the island: morph to the expanded panel under the cursor
-    /// and hand the drag off to the window so it follows the mouse seamlessly.
-    func expandFromDrag(with event: NSEvent) {
-        guard isCollapsed else { return }
-        isCollapsed = false
-        UserDefaults.standard.set(false, forKey: "IslandCollapsed")
-        // Panel top edge lands just under the cursor so it hangs from the drag.
-        let mouse = NSEvent.mouseLocation
-        let height = max(panel.frame.height, 120)
-        let frame = NSRect(x: mouse.x - panelWidth / 2,
-                           y: mouse.y + 14 - height,
-                           width: panelWidth, height: height)
-        applyExpandedLayout(frameOverride: frame, animate: false)
-        panel.performDrag(with: event)
-    }
-
-    /// Expanded panel dragged against the notch: swallow it.
-    @objc private func panelDidMove(_ note: Notification) {
-        guard !isCollapsed, let screen = notchScreen else { return }
-        let inZone = panel.frame.maxY >= screen.visibleFrame.maxY - 4
-            && abs(panel.frame.midX - screen.frame.midX) < notchMetrics(on: screen).width
-            && screen.frame.contains(NSPoint(x: panel.frame.midX, y: screen.frame.maxY - 1))
-        guard inZone else { return }
-        if NSEvent.pressedMouseButtons != 0 {
-            // Still dragging — check again shortly.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.panelDidMove(note)
+        // Slide down out of the notch first, then reveal the content —
+        // the black shape grows out of the hardware.
+        content.alphaValue = animate ? 0 : 1
+        positionExpanded(rows: lastSessions.isEmpty ? [] : sortedForDisplay(lastSessions),
+                         animate: animate)
+        let reveal = { [weak self] in
+            guard let self = self, !self.isCollapsed else { return }
+            NSLayoutConstraint.activate(self.expandedConstraints)
+            self.rowsStack.isHidden = false
+            self.collapseButton.isHidden = false
+            self.footerLabel.isHidden = self.lastReachable
+            self.headerMark.isHidden = false
+            self.headerCounts.isHidden = false
+            self.headerLabel.attributedStringValue = NSAttributedString(
+                string: "SESSIONS",
+                attributes: [
+                    .font: Theme.display(9, .heavy),
+                    .kern: 1.5,
+                    .foregroundColor: Theme.coral.withAlphaComponent(0.9),
+                ])
+            self.render(sessions: self.lastSessions)
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                self.content.animator().alphaValue = 1
             }
-            return
         }
-        // Dropped on the notch: remember a sane expanded position (not the
-        // notch itself), then collapse.
-        var remembered = panel.frame
-        remembered.origin.y = screen.visibleFrame.maxY - remembered.height - 24
-        UserDefaults.standard.set(NSStringFromRect(remembered), forKey: "ExpandedFrame")
-        isCollapsed = true
-        UserDefaults.standard.set(true, forKey: "IslandCollapsed")
-        applyIslandLayout(animate: true)
+        if animate {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: reveal)
+        } else {
+            reveal()
+        }
     }
 
     // MARK: Panel construction
@@ -1075,13 +1049,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         content.addSubview(islandMark)
         content.addSubview(islandCounts)
 
+        // Expanded content starts BELOW the physical notch (dead pixels).
+        headerTop = headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 44)
         NSLayoutConstraint.activate([
+            headerTop,
             headerMark.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
             headerMark.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
             headerMark.widthAnchor.constraint(equalToConstant: 13),
             headerMark.heightAnchor.constraint(equalToConstant: 13),
 
-            headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
             headerLabel.leadingAnchor.constraint(equalTo: headerMark.trailingAnchor, constant: 7),
 
             collapseButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -13),
@@ -1118,24 +1094,17 @@ final class AppController: NSObject, NSApplicationDelegate {
             islandCounts.centerYAnchor.constraint(equalTo: content.centerYAnchor),
         ])
 
-        // Snap-to-notch: watch the panel being dragged against the notch.
-        NotificationCenter.default.addObserver(self, selector: #selector(panelDidMove),
-                                               name: NSWindow.didMoveNotification, object: panel)
+        // The panel is part of the notch UI in both modes: pure black, no
+        // shadow, above everything, pinned through Space transitions.
+        panel.appearance = NSAppearance(named: .darkAqua)
+        tintView.layer?.backgroundColor = NSColor.black.cgColor
+        panel.hasShadow = false
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.isMovableByWindowBackground = false
 
         panel.contentView = effectView
-        panel.setFrameAutosaveName("ClaudeSessionsPanel")
-        if panel.frame.origin == .zero {
-            positionTopRight()
-        }
         panel.orderFrontRegardless()
-    }
-
-    private func positionTopRight() {
-        guard let screen = NSScreen.main else { return }
-        let vf = screen.visibleFrame
-        let x = vf.maxX - panelWidth - 20
-        let y = vf.maxY - 400
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
     // MARK: Refresh
@@ -1165,19 +1134,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         // The mark spins while loading or when the daemon is unreachable.
         headerMark.spinning = !hadFirstData || !result.reachable
         islandMark.spinning = headerMark.spinning
-        // Island stays pure black (seamless with the notch); expanded gets
-        // the warm Claude tint, refreshed here so appearance changes track.
-        tintView.layer?.backgroundColor = isCollapsed
-            ? NSColor.black.cgColor : Theme.surfaceTint.cgColor
         render(sessions: lastSessions)
     }
 
     private func statusOrder(_ s: SessionStatus) -> Int { s.rawValue }
 
-    private func render(sessions: [Session]) {
-        // Two-level ordering: top-level sessions by status, each followed
-        // inline by its subagent children (also by status). A child whose
-        // parent vanished is promoted to top level.
+    /// Two-level ordering: top-level sessions by status, each followed inline
+    /// by its subagent children (also by status). A child whose parent
+    /// vanished is promoted to top level.
+    private func sortedForDisplay(_ sessions: [Session]) -> [Session] {
         let byStatus: (Session, Session) -> Bool = { a, b in
             if a.status.rawValue != b.status.rawValue { return a.status.rawValue < b.status.rawValue }
             return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
@@ -1191,6 +1156,11 @@ final class AppController: NSObject, NSApplicationDelegate {
             sorted.append(parent)
             sorted.append(contentsOf: (childrenOf[parent.sessionId] ?? []).sorted(by: byStatus))
         }
+        return sorted
+    }
+
+    private func render(sessions: [Session]) {
+        let sorted = sortedForDisplay(sessions)
 
         // Island mode: no rows in the hierarchy at all — their (even hidden)
         // constraints would force a minimum window size and block the small
@@ -1239,16 +1209,10 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         updateHeaderCounts(sorted: sorted)
 
-        resizePanel(rows: sorted)
-
-        // All-idle → dim (never in island mode — the pill stays readable).
-        let anyActive = sorted.contains { $0.status != .idle }
-        let target: CGFloat = anyActive ? 1.0 : 0.3
-        if abs(panel.alphaValue - target) > 0.01 {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.4
-                panel.animator().alphaValue = target
-            }
+        positionExpanded(rows: sorted, animate: false)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let row = self.rowsStack.arrangedSubviews.first else { return }
+            dbg("dbg frames: panel=\(self.panel.frame.size) content=\(self.content.frame.size) effect=\(self.effectView.frame.size) row=\(row.frame) stack=\(self.rowsStack.frame)")
         }
     }
 
@@ -1285,21 +1249,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         headerCounts.attributedStringValue = summary
         islandCounts.attributedStringValue = summary
-    }
-
-    private func resizePanel(rows: [Session]) {
-        let headerH: CGFloat = 12 + 14 + 8
-        let rowsH = rows.reduce(CGFloat(0)) { $0 + ($1.parentId != nil ? 36 : 46) }
-            + CGFloat(max(rows.count - 1, 0)) * 3
-        let footerH: CGFloat = footerLabel.isHidden ? 0 : 18
-        let bottomPad: CGFloat = 10
-        let height = max(64, headerH + rowsH + footerH + bottomPad)
-
-        var frame = panel.frame
-        let delta = height - frame.height
-        frame.size.height = height
-        frame.origin.y -= delta // keep top edge fixed
-        panel.setFrame(frame, display: true, animate: false)
     }
 
     // MARK: Click to focus
