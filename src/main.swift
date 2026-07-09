@@ -747,8 +747,14 @@ final class ContentView: NSView {
 
 final class AppController: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
-    private var effectView: NSVisualEffectView!
+    // Plain layer-backed root — NEVER NSVisualEffectView: vibrancy blends
+    // subview colors with the desktop behind, so "black" renders as gray and
+    // can't match the true-black hardware notch.
+    private var effectView: NSView!
     private var tintView: NSView!
+    // While a slide animation is in flight, periodic refresh must not stomp
+    // the frame with a non-animated setFrame.
+    private var transitionUntil = Date.distantPast
     private var content: ContentView!
     private var headerMark: ClaudeMark!
     private var headerLabel: NSTextField!
@@ -835,12 +841,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         headerCounts.isHidden = true
         headerLabel.attributedStringValue = NSAttributedString(string: "")
         NSLayoutConstraint.deactivate(expandedConstraints)
+        // Guard BEFORE the render below so it can't snap frame/mask mid-slide.
+        if animate { transitionUntil = Date().addingTimeInterval(0.5) }
         render(sessions: lastSessions)  // strips rows so the small frame can apply
         // Slide up into the notch, then reveal the wing content.
         islandMark.isHidden = true
         islandCounts.isHidden = true
         positionIsland(animate: animate)
-        DispatchQueue.main.asyncAfter(deadline: .now() + (animate ? 0.28 : 0)) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + (animate ? 0.44 : 0)) { [weak self] in
             guard let self = self, self.isCollapsed else { return }
             self.islandMark.isHidden = false
             self.islandCounts.isHidden = false
@@ -885,6 +893,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5
         if changed {
             if animate {
+                transitionUntil = Date().addingTimeInterval(0.5)
                 NSAnimationContext.runAnimationGroup { ctx in
                     // MediaMate-style feel: fast out of the notch, silky settle.
                     ctx.duration = 0.42
@@ -892,17 +901,20 @@ final class AppController: NSObject, NSApplicationDelegate {
                     ctx.allowsImplicitAnimation = true
                     panel.animator().setFrame(target, display: true)
                 }
+            } else if Date() < transitionUntil {
+                // Never stomp an in-flight slide with an instant jump.
+                return
             } else {
                 panel.setFrame(target, display: true)
             }
         }
-        applyNotchMask(size: target.size, bottomRadius: bottomRadius)
+        applyNotchMask(size: target.size, bottomRadius: bottomRadius, animated: animate)
     }
 
     /// Apple's notch silhouette (DynamicNotchKit's NotchShape, in layer
     /// coordinates): top corners flare OUTWARD into the bezel, bottom corners
     /// are convex. This is what makes it read as hardware.
-    private func applyNotchMask(size: CGSize, bottomRadius: CGFloat) {
+    private func applyNotchMask(size: CGSize, bottomRadius: CGFloat, animated: Bool = false) {
         let tr: CGFloat = 8    // top flare radius
         let br: CGFloat = bottomRadius
         let w = size.width, h = size.height
@@ -916,8 +928,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         p.addLine(to: CGPoint(x: w - tr, y: h - tr))
         p.addQuadCurve(to: CGPoint(x: w, y: h), control: CGPoint(x: w - tr, y: h))
         p.closeSubpath()
+        if animated, let old = islandMask.path {
+            let a = CABasicAnimation(keyPath: "path")
+            a.fromValue = old
+            a.toValue = p
+            a.duration = 0.42
+            a.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+            islandMask.add(a, forKey: "morph")
+        }
         islandMask.path = p
-        islandMask.frame = CGRect(origin: .zero, size: size)
+        // Oversized so the mask layer itself never clips mid-animation.
+        islandMask.frame = CGRect(x: 0, y: 0, width: 4000, height: 4000)
         effectView.layer?.mask = islandMask
     }
 
@@ -951,7 +972,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         if animate {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.26, execute: reveal)
+            // After the slide finishes (0.42s), fade the content in.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.44, execute: reveal)
         } else {
             reveal()
         }
@@ -974,19 +996,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
 
-        effectView = NSVisualEffectView(frame: initialRect)
-        effectView.material = .hudWindow
-        effectView.blendingMode = .behindWindow
-        effectView.state = .active
+        effectView = NSView(frame: initialRect)
         effectView.wantsLayer = true
         effectView.layer?.cornerRadius = 14
         effectView.layer?.masksToBounds = true
         effectView.autoresizingMask = [.width, .height]
 
-        // Warm Claude surface tint over the vibrancy material.
+        // True black, matching the hardware notch exactly.
         tintView = NSView(frame: initialRect)
         tintView.wantsLayer = true
-        tintView.layer?.backgroundColor = Theme.surfaceTint.cgColor
+        tintView.layer?.backgroundColor = NSColor.black.cgColor
         tintView.autoresizingMask = [.width, .height]
         effectView.addSubview(tintView)
 
