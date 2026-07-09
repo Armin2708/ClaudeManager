@@ -793,7 +793,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         buildPanel()
         headerMark.spinning = true  // loading until first data arrives
-        if isCollapsed { applyIslandLayout() }
+        if isCollapsed { applyIslandLayout() } else { applyExpandedLayout() }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
