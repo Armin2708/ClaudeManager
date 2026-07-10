@@ -1,11 +1,11 @@
 {
   "repoPath": "/Users/arminrad/Desktop/claude-sessions-panel",
-  "lastCommit": "e427a79244036f80a7297976b4cb985e83f0bff9",
-  "indexedAt": "2026-07-10T10:19:30.317Z",
+  "lastCommit": "1296987334cd591e264b50e9e3b36d710ad16c0d",
+  "indexedAt": "2026-07-10T11:51:42.067Z",
   "stats": {
-    "files": 10,
-    "nodes": 52,
-    "edges": 44,
+    "files": 11,
+    "nodes": 54,
+    "edges": 45,
     "communities": 0,
     "processes": 0,
     "embeddings": 0
