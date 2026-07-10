@@ -998,7 +998,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Wings flank the physical notch: mark on the left, counts on the right.
         let wing = max(islandCounts.intrinsicContentSize.width, 14) + 26
         let w = notch.width + wing * 2
-        let h = notch.height + 8   // small lip below the notch
+        // Exactly the hardware notch band: bottom edge and 13pt bottom corner
+        // radius line up 1:1 with the real notch (measured: 32pt tall, r≈13).
+        let h = notch.height
         let x = screen.frame.midX - w / 2
         let y = screen.frame.maxY - h
         islandMarkX.constant = wing / 2
