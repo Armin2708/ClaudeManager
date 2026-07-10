@@ -1045,10 +1045,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
 
+        // Shape comes solely from the mask — no layer corner rounding, so the
+        // top corners stay square and flush with the screen edge.
         effectView = NSView(frame: initialRect)
         effectView.wantsLayer = true
-        effectView.layer?.cornerRadius = 14
-        effectView.layer?.masksToBounds = true
         effectView.autoresizingMask = [.width, .height]
 
         // True black, matching the hardware notch exactly.
