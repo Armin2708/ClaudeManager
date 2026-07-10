@@ -1050,10 +1050,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         let changed = abs(panel.frame.minX - target.minX) > 0.5 || abs(panel.frame.minY - target.minY) > 0.5
             || abs(panel.frame.width - target.width) > 0.5 || abs(panel.frame.height - target.height) > 0.5
         if !animate {
-            if changed {
-                if Date() < transitionUntil { return }  // never stomp a slide
-                panel.setFrame(target, display: true)
-            }
+            // Never disturb an in-flight slide — including the mask: on
+            // expand the union frame EQUALS the target (changed == false), and
+            // an unguarded applyMask here removes the "morph" animation,
+            // snapping the shape mid-slide. That was the intermittent lag:
+            // any 2s poll landing inside the 0.46s window killed the morph.
+            if Date() < transitionUntil { return }
+            if changed { panel.setFrame(target, display: true) }
             applyMask(rect: NSRect(origin: .zero, size: target.size),
                       bottomRadius: bottomRadius, animated: false)
             return
@@ -1396,8 +1399,25 @@ final class AppController: NSObject, NSApplicationDelegate {
         // The mark spins while loading or when the daemon is unreachable.
         headerMark.spinning = !hadFirstData || !result.reachable
         islandMark.spinning = headerMark.spinning
+        // Poll results landing mid-slide would relayout/redraw the whole
+        // content tree while the mask morph is compositing — defer one render
+        // to just after the slide lands instead.
+        if Date() < transitionUntil {
+            if !renderDeferred {
+                renderDeferred = true
+                let delay = transitionUntil.timeIntervalSinceNow + 0.05
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self = self else { return }
+                    self.renderDeferred = false
+                    self.render(sessions: self.lastSessions)
+                }
+            }
+            return
+        }
         render(sessions: lastSessions)
     }
+
+    private var renderDeferred = false
 
     private func statusOrder(_ s: SessionStatus) -> Int { s.rawValue }
 
@@ -1474,14 +1494,20 @@ final class AppController: NSObject, NSApplicationDelegate {
             ordered.append(row)
         }
 
-        // Re-order stack to match sort.
-        for v in rowsStack.arrangedSubviews { rowsStack.removeArrangedSubview(v) }
-        for v in ordered {
-            rowsStack.addArrangedSubview(v)
-            if v.widthConstraint == nil {
-                v.widthConstraint = v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor)
+        // Re-order the stack only when membership/order actually changed —
+        // the remove-all/re-add-all churn every poll is wasted layout work.
+        let current = rowsStack.arrangedSubviews.compactMap { $0 as? RowView }
+        let needsReorder = current.count != ordered.count
+            || !zip(current, ordered).allSatisfy { $0 === $1 }
+        if needsReorder {
+            for v in rowsStack.arrangedSubviews { rowsStack.removeArrangedSubview(v) }
+            for v in ordered {
+                rowsStack.addArrangedSubview(v)
+                if v.widthConstraint == nil {
+                    v.widthConstraint = v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor)
+                }
+                v.widthConstraint?.isActive = true
             }
-            v.widthConstraint?.isActive = true
         }
         // Heal orphans: any row subview the stack no longer arranges keeps a
         // stale frame and overlaps live rows. Log it — it's a bug upstream.
