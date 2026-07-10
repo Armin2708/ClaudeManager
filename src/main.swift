@@ -873,6 +873,50 @@ final class AppController: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        offerHookInstallIfNeeded()
+    }
+
+    // MARK: First-run hook setup
+
+    /// Plug-and-play: a downloaded app offers to register its own hook
+    /// entries on first launch instead of pointing users at the README.
+    private func offerHookInstallIfNeeded() {
+        guard !HookInstaller.isInstalled(),
+              !UserDefaults.standard.bool(forKey: "HookInstallDeclined") else { return }
+        let alert = NSAlert()
+        alert.messageText = "Set up Claude Code session tracking?"
+        alert.informativeText = """
+        ClaudeSessions adds seven hook entries to ~/.claude/settings.json so \
+        Claude Code reports each session's status to the panel. Your current \
+        settings are backed up to settings.json.bak first.
+        """
+        alert.addButton(withTitle: "Install Hooks")
+        alert.addButton(withTitle: "Not Now")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            runHookInstall()
+        } else {
+            UserDefaults.standard.set(true, forKey: "HookInstallDeclined")
+        }
+    }
+
+    @objc fileprivate func installHooksClicked() {
+        UserDefaults.standard.set(false, forKey: "HookInstallDeclined")
+        runHookInstall()
+    }
+
+    private func runHookInstall() {
+        let done = NSAlert()
+        do {
+            try HookInstaller.install()
+            done.messageText = "Hooks installed"
+            done.informativeText = "Claude Code sessions will report their status from their next turn on."
+        } catch {
+            done.messageText = "Couldn't install hooks"
+            done.informativeText = error.localizedDescription
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        done.runModal()
     }
 
     // MARK: Island (collapse) mode
@@ -1770,6 +1814,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         if !launchAtLoginAvailable() { loginItem.isEnabled = false }
         menu.addItem(loginItem)
 
+        let hooksInstalled = HookInstaller.isInstalled()
+        let hooksItem = NSMenuItem(title: hooksInstalled ? "Claude Code Hooks: Installed" : "Install Claude Code Hooks…",
+                                   action: #selector(installHooksClicked), keyEquivalent: "")
+        hooksItem.target = self
+        hooksItem.state = hooksInstalled ? .on : .off
+        menu.addItem(hooksItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -1819,7 +1870,211 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - Hook mode (`ClaudeSessions --hook`)
+//
+// The binary doubles as the Claude Code hook: it reads one hook-event JSON
+// payload on stdin and maintains ~/.claude/session-status/<sid>.json — the
+// same contract as hooks/session-status.sh, with no jq/bash dependency, so
+// a downloaded app needs zero terminal setup. Must never block Claude Code:
+// every failure path is a silent no-op.
+enum HookRunner {
+    static func run() {
+        let input = FileHandle.standardInput.readDataToEndOfFile()
+        guard let payload = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any],
+              let event = payload["hook_event_name"] as? String,
+              let sid = payload["session_id"] as? String, !sid.isEmpty else { return }
+        let dir = Env.statusDir
+        let file = (dir as NSString).appendingPathComponent("\(sid).json")
+        let fm = FileManager.default
+
+        if event == "SessionEnd" {
+            try? fm.removeItem(atPath: file)
+            return
+        }
+
+        var obj: [String: Any] = [:]
+        if let data = fm.contents(atPath: file),
+           let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            obj = existing
+        }
+        obj["session_id"] = sid
+        if let cwd = payload["cwd"] as? String, !cwd.isEmpty { obj["cwd"] = cwd }
+        if let t = transcriptTitle(payload["transcript_path"] as? String), !t.isEmpty {
+            obj["title"] = t
+        }
+        obj["updated_at"] = Int(Date().timeIntervalSince1970)
+        obj["event"] = event
+
+        var children = (obj["children"] as? [[String: Any]]) ?? []
+
+        switch event {
+        case "UserPromptSubmit":
+            // New turn starts clean.
+            obj["status"] = "working"
+            children = []
+        case "Notification":
+            obj["status"] = "waiting"
+        case "Stop":
+            // Same guard as the stop sound: still working while background
+            // tasks run or scheduled wakeups (crons) are pending.
+            let tasks = (payload["background_tasks"] as? [[String: Any]]) ?? []
+            let running = tasks.filter { ($0["status"] as? String) == "running" }
+            let crons = (payload["session_crons"] as? [Any]) ?? []
+            // Agent children are owned by the SubagentStart/Stop lifecycle
+            // (which knows their given names); tasks are republished fresh.
+            children = children.filter { ($0["kind"] as? String) == "agent" }
+            if !running.isEmpty || !crons.isEmpty {
+                obj["status"] = "working"
+                for t in running {
+                    let kind = (t["type"] as? String) ?? "task"
+                    // A lingering teammate here would only duplicate the
+                    // agent row with a prompt snippet as its name.
+                    if kind.contains("teammate") || kind.contains("agent") { continue }
+                    children.append([
+                        "id": (t["id"] as? String) ?? "task",
+                        "kind": kind,
+                        "name": (t["description"] as? String) ?? (t["command"] as? String) ?? kind,
+                    ])
+                }
+            } else {
+                obj["status"] = "done_unseen"
+            }
+        case "StopFailure":
+            obj["status"] = "error"
+        case "SubagentStart":
+            let id = str(payload, "agent_id", "agentId", "task_id", "id") ?? "agent"
+            let name = str(payload, "agent_name", "name", "description",
+                           "agent_type", "subagent_type") ?? "subagent"
+            children.removeAll { ($0["id"] as? String) == id }
+            children.append(["id": id, "kind": "agent", "name": name])
+        case "SubagentStop":
+            let id = str(payload, "agent_id", "agentId", "task_id", "id") ?? "agent"
+            children.removeAll { ($0["id"] as? String) == id }
+        default:
+            return
+        }
+        obj["children"] = children
+
+        try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if let out = try? JSONSerialization.data(withJSONObject: obj) {
+            try? out.write(to: URL(fileURLWithPath: file), options: .atomic)
+        }
+    }
+
+    private static func str(_ d: [String: Any], _ keys: String...) -> String? {
+        for k in keys {
+            if let v = d[k] as? String, !v.isEmpty { return v }
+        }
+        return nil
+    }
+
+    /// Last {"type":"ai-title","aiTitle":...} entry in the transcript is the
+    /// session's current topic title. Memory-mapped: transcripts get large.
+    private static func transcriptTitle(_ path: String?) -> String? {
+        guard let path = path, !path.isEmpty,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe),
+              let marker = "\"type\":\"ai-title\"".data(using: .utf8),
+              let hit = data.range(of: marker, options: .backwards) else { return nil }
+        let nl = UInt8(ascii: "\n")
+        let start = data[..<hit.lowerBound].lastIndex(of: nl).map { data.index(after: $0) } ?? data.startIndex
+        let end = data[hit.upperBound...].firstIndex(of: nl) ?? data.endIndex
+        guard let line = (try? JSONSerialization.jsonObject(with: data[start..<end])) as? [String: Any] else {
+            return nil
+        }
+        return line["aiTitle"] as? String
+    }
+}
+
+// MARK: - Hook installer (plug-and-play setup)
+//
+// Registers `<this binary> --hook` for the seven session-status events in
+// ~/.claude/settings.json so a downloaded app works without any terminal
+// steps. A developer install using hooks/session-status.sh counts as
+// installed — never double-register.
+enum HookInstaller {
+    static let events = ["UserPromptSubmit", "Notification", "Stop", "StopFailure",
+                         "SessionEnd", "SubagentStart", "SubagentStop"]
+
+    static var settingsPath: String {
+        if let o = ProcessInfo.processInfo.environment["CLAUDE_SETTINGS_PATH"], !o.isEmpty {
+            return (o as NSString).expandingTildeInPath
+        }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(".claude/settings.json")
+    }
+
+    static var hookCommand: String {
+        "\"\(Bundle.main.executablePath ?? "")\" --hook"
+    }
+
+    private static func isOurs(_ command: String) -> Bool {
+        command.contains("session-status.sh")
+            || (command.contains("ClaudeSessions") && command.contains("--hook"))
+    }
+
+    private static func commands(in settings: [String: Any], event: String) -> [String] {
+        guard let hooks = settings["hooks"] as? [String: Any],
+              let entries = hooks[event] as? [[String: Any]] else { return [] }
+        return entries.flatMap { entry in
+            ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["command"] as? String }
+        }
+    }
+
+    static func isInstalled() -> Bool {
+        guard let data = FileManager.default.contents(atPath: settingsPath),
+              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return false
+        }
+        return events.allSatisfy { commands(in: settings, event: $0).contains(where: isOurs) }
+    }
+
+    static func install() throws {
+        let fm = FileManager.default
+        var settings: [String: Any] = [:]
+        if let data = fm.contents(atPath: settingsPath) {
+            guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw NSError(domain: "HookInstaller", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(settingsPath) is not valid JSON. Fix it first — nothing was changed."])
+            }
+            settings = parsed
+            // Backup before the first write ever touches the file.
+            try data.write(to: URL(fileURLWithPath: settingsPath + ".bak"))
+        } else {
+            try fm.createDirectory(atPath: (settingsPath as NSString).deletingLastPathComponent,
+                                   withIntermediateDirectories: true)
+        }
+        var hooks = (settings["hooks"] as? [String: Any]) ?? [:]
+        for ev in events {
+            if commands(in: settings, event: ev).contains(where: isOurs) { continue }
+            var entries = (hooks[ev] as? [[String: Any]]) ?? []
+            entries.append(["hooks": [["type": "command", "command": hookCommand, "timeout": 5]]])
+            hooks[ev] = entries
+        }
+        settings["hooks"] = hooks
+        let out = try JSONSerialization.data(withJSONObject: settings,
+                                             options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: URL(fileURLWithPath: settingsPath), options: .atomic)
+    }
+}
+
 // MARK: - Entry point
+
+if CommandLine.arguments.contains("--hook") {
+    HookRunner.run()
+    exit(0)
+}
+
+// Scriptable setup (used by install.sh; the app also offers this on first run).
+if CommandLine.arguments.contains("--install-hooks") {
+    do {
+        try HookInstaller.install()
+        print("Hooks installed into \(HookInstaller.settingsPath)")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
 
 let app = NSApplication.shared
 let controller = AppController()
