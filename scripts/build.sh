@@ -25,6 +25,10 @@ if [ ! -f "$ICON" ]; then
 fi
 cp "$ICON" "$APP_DIR/Contents/Resources/ClaudeSessions.icns"
 
+# Source-toggle logos (rendered as template images at runtime)
+cp "$REPO_DIR/assets/claude-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
+cp "$REPO_DIR/assets/codex-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
+
 echo "==> Writing Info.plist"
 cat > "$PLIST" <<'PLIST_EOF'
 <?xml version="1.0" encoding="UTF-8"?>

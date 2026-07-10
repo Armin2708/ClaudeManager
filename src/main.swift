@@ -399,6 +399,58 @@ final class DataSource {
         return Result(sessions: withChildren, reachable: true)
     }
 
+    // MARK: Codex sessions (process scan — Codex has no hook/status contract)
+
+    /// Live Codex CLI sessions: interactive `codex` processes (ones with a
+    /// controlling terminal), cwd via lsof. Status is a CPU heuristic — the
+    /// TUI idles near 0% while waiting for input and burns CPU while working.
+    func fetchCodex() -> Result {
+        guard let r = runProcess("/bin/ps", ["-axo", "pid=,ppid=,%cpu=,tty=,command="]), r.code == 0 else {
+            return Result(sessions: [], reachable: false)
+        }
+        struct Proc { let pid: Int; let ppid: Int; let cpu: Double; let tty: String }
+        var procs: [Proc] = []
+        for line in r.out.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
+            guard parts.count == 5,
+                  let pid = Int(parts[0]), let ppid = Int(parts[1]),
+                  let cpu = Double(parts[2]) else { continue }
+            let tty = String(parts[3])
+            let cmd = String(parts[4])
+            guard tty != "??" else { continue }  // interactive sessions only
+            let bin = cmd.split(separator: " ").first.map { ($0 as NSString).lastPathComponent } ?? ""
+            let isCodex = bin == "codex" || (bin == "node" && cmd.contains("/codex"))
+            guard isCodex else { continue }
+            procs.append(Proc(pid: pid, ppid: ppid, cpu: cpu, tty: tty))
+        }
+        // Drop children of other codex processes (exec/sandbox subprocesses).
+        let pids = Set(procs.map { $0.pid })
+        procs.removeAll { pids.contains($0.ppid) }
+
+        TitleResolver.shared.refresh(pids: procs.map { $0.pid })
+        var sessions: [Session] = []
+        for p in procs {
+            let cwd = cwdOf(pid: p.pid)
+            let folder = (cwd as NSString).lastPathComponent
+            sessions.append(Session(sessionId: "codex-\(p.pid)",
+                                    name: folder.isEmpty ? "codex" : folder,
+                                    cwd: cwd,
+                                    pid: p.pid,
+                                    status: p.cpu > 8 ? .working : .idle,
+                                    fromFile: false))
+        }
+        return Result(sessions: sessions, reachable: true)
+    }
+
+    private func cwdOf(pid: Int) -> String {
+        guard let r = runProcess("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]),
+              r.code == 0 else { return "" }
+        for line in r.out.split(separator: "\n") where line.hasPrefix("n") {
+            return String(line.dropFirst())
+        }
+        return ""
+    }
+
     private struct Agent {
         let pid: Int; let cwd: String; let sessionId: String; let name: String; let status: String
     }
@@ -500,6 +552,13 @@ enum Theme {
 final class ClaudeMark: NSView {
     private let rays = CAShapeLayer()
 
+    // Dimmed when Claude is the inactive side of the source toggle.
+    var active = true {
+        didSet {
+            rays.strokeColor = (active ? Theme.coral : NSColor.tertiaryLabelColor).cgColor
+        }
+    }
+
     var spinning = false {
         didSet {
             guard spinning != oldValue else { return }
@@ -542,7 +601,7 @@ final class ClaudeMark: NSView {
             path.addLine(to: CGPoint(x: c.x + cos(angle) * r, y: c.y + sin(angle) * r))
         }
         rays.path = path
-        rays.strokeColor = Theme.coral.cgColor
+        rays.strokeColor = (active ? Theme.coral : NSColor.tertiaryLabelColor).cgColor
         rays.fillColor = nil
         rays.lineWidth = max(1.6, R * 0.16)
         rays.lineCap = .round
@@ -593,6 +652,9 @@ final class RowView: NSView {
     private var barLeading: NSLayoutConstraint!
     private var rowHeight: NSLayoutConstraint!
     private var hovered = false
+    // Pins the row to the stack width; created once and reactivated on
+    // re-add instead of leaking a fresh duplicate every refresh.
+    var widthConstraint: NSLayoutConstraint?
     var onClick: ((RowView) -> Void)?
 
     init(session: Session) {
@@ -761,7 +823,13 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var suppressPositioning = false
     private var content: ContentView!
     private var headerMark: ClaudeMark!
-    private var headerLabel: NSTextField!
+    // The CLAUDE / CODEX source toggle: real buttons (labels + gesture
+    // recognizers lose clicks to the window-background drag), each with its
+    // brand logo — the starburst headerMark doubles as the Claude icon.
+    private var claudeBtn: NSButton!
+    private var codexBtn: NSButton!
+    private var codexIcon: NSImageView!
+    private var codexLogo: NSImage?
     private var headerCounts: NSTextField!
     private var collapseButton: NSButton!
     // Island-only widgets: mark in the left notch wing, counts in the right.
@@ -780,6 +848,11 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var lastReachable = true
     private var lastSessions: [Session] = []
     private var hadFirstData = false
+
+    // Which CLI's sessions the panel shows.
+    private enum SessionSource: Int { case claude = 0, codex = 1 }
+    private var source = SessionSource(
+        rawValue: UserDefaults.standard.integer(forKey: "SessionSource")) ?? .claude
 
     // Island (collapsed) mode — a small capsule docked beside the notch.
     private(set) var isCollapsed = UserDefaults.standard.bool(forKey: "IslandCollapsed")
@@ -818,6 +891,58 @@ final class AppController: NSObject, NSApplicationDelegate {
         if isCollapsed { toggleIsland() }
     }
 
+    // MARK: Source toggle (CLAUDE / CODEX)
+
+    @objc private func selectClaude() { setSource(.claude) }
+    @objc private func selectCodex() { setSource(.codex) }
+
+    private func setSource(_ s: SessionSource) {
+        guard s != source else { return }
+        source = s
+        UserDefaults.standard.set(s.rawValue, forKey: "SessionSource")
+        updateSourceHeader()
+        // Clear the other CLI's rows right away; the mark spins until the
+        // first fetch for the new source lands.
+        lastSessions = []
+        hadFirstData = false
+        headerMark.spinning = true
+        render(sessions: [])
+        refresh()
+    }
+
+    private func headerWord(_ s: String, active: Bool) -> NSAttributedString {
+        NSAttributedString(string: s, attributes: [
+            .font: Theme.display(9, .heavy),
+            .kern: 1.5,
+            .foregroundColor: active
+                ? Theme.coral.withAlphaComponent(0.9)
+                : NSColor.tertiaryLabelColor,
+        ])
+    }
+
+    private func updateSourceHeader() {
+        claudeBtn.attributedTitle = headerWord("CLAUDE", active: source == .claude)
+        codexBtn.attributedTitle = headerWord("CODEX", active: source == .codex)
+        headerMark.active = source == .claude
+        // Tint is baked into a raster copy — template tinting doesn't apply
+        // reliably to SVG-backed NSImages.
+        if let logo = codexLogo {
+            let color: NSColor = source == .codex ? .white : .tertiaryLabelColor
+            codexIcon.image = tinted(logo, color: color, size: NSSize(width: 24, height: 24))
+        }
+    }
+
+    private func tinted(_ image: NSImage, color: NSColor, size: NSSize) -> NSImage {
+        let out = NSImage(size: size)
+        out.lockFocus()
+        let rect = NSRect(origin: .zero, size: size)
+        image.draw(in: rect)
+        color.set()
+        rect.fill(using: .sourceAtop)
+        out.unlockFocus()
+        return out
+    }
+
     /// The built-in notched display; NSScreen.main follows keyboard focus and
     /// wanders across monitors.
     private var notchScreen: NSScreen? {
@@ -843,7 +968,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         collapseButton.isHidden = true
         headerMark.isHidden = true
         headerCounts.isHidden = true
-        headerLabel.attributedStringValue = NSAttributedString(string: "")
+        claudeBtn.isHidden = true
+        codexBtn.isHidden = true
+        codexIcon.isHidden = true
         isDetached = false
         panel.hasShadow = false
         panel.level = .screenSaver
@@ -887,7 +1014,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func positionExpanded(rows: [Session], animate: Bool = false) {
         guard let screen = notchScreen else { return }
         let notch = notchMetrics(on: screen)
-        let topInset: CGFloat = isDetached ? 4 : notch.height + 6
+        let topInset: CGFloat = isDetached ? 12 : notch.height + 6
         headerTop.constant = topInset
         // Ask Auto Layout for the exact minimum height — a hand-computed
         // number that undershoots gets silently clamped by constraints while
@@ -1005,13 +1132,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         footerLabel.isHidden = lastReachable
         headerMark.isHidden = false
         headerCounts.isHidden = false
-        headerLabel.attributedStringValue = NSAttributedString(
-            string: "SESSIONS",
-            attributes: [
-                .font: Theme.display(9, .heavy),
-                .kern: 1.5,
-                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
-            ])
+        claudeBtn.isHidden = false
+        codexBtn.isHidden = false
+        codexIcon.isHidden = false
+        updateSourceHeader()
         suppressPositioning = true
         render(sessions: lastSessions)
         suppressPositioning = false
@@ -1066,15 +1190,28 @@ final class AppController: NSObject, NSApplicationDelegate {
         headerMark = ClaudeMark(frame: .zero)
         headerMark.translatesAutoresizingMaskIntoConstraints = false
 
-        headerLabel = NSTextField(labelWithString: "")
-        headerLabel.attributedStringValue = NSAttributedString(
-            string: "SESSIONS",
-            attributes: [
-                .font: Theme.display(9, .heavy),
-                .kern: 1.5,
-                .foregroundColor: Theme.coral.withAlphaComponent(0.9),
-            ])
-        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        claudeBtn = NSButton(title: "", target: self, action: #selector(selectClaude))
+        claudeBtn.isBordered = false
+        claudeBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        codexBtn = NSButton(title: "", target: self, action: #selector(selectCodex))
+        codexBtn.isBordered = false
+        codexBtn.translatesAutoresizingMaskIntoConstraints = false
+
+        codexIcon = NSImageView()
+        codexIcon.translatesAutoresizingMaskIntoConstraints = false
+        codexIcon.imageScaling = .scaleProportionallyUpOrDown
+        if let p = Bundle.main.path(forResource: "codex-logo", ofType: "svg") {
+            codexLogo = NSImage(contentsOfFile: p)
+        }
+        codexIcon.addGestureRecognizer(
+            NSClickGestureRecognizer(target: self, action: #selector(selectCodex)))
+
+        // The starburst mark is the Claude side's logo — clicking it selects.
+        headerMark.addGestureRecognizer(
+            NSClickGestureRecognizer(target: self, action: #selector(selectClaude)))
+
+        updateSourceHeader()
 
         headerCounts = NSTextField(labelWithString: "")
         headerCounts.alignment = .right
@@ -1109,7 +1246,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         islandCounts.isHidden = true
 
         content.addSubview(headerMark)
-        content.addSubview(headerLabel)
+        content.addSubview(claudeBtn)
+        content.addSubview(codexIcon)
+        content.addSubview(codexBtn)
         content.addSubview(headerCounts)
         content.addSubview(collapseButton)
         content.addSubview(rowsStack)
@@ -1118,22 +1257,30 @@ final class AppController: NSObject, NSApplicationDelegate {
         content.addSubview(islandCounts)
 
         // Expanded content starts BELOW the physical notch (dead pixels).
-        headerTop = headerLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 44)
+        headerTop = claudeBtn.topAnchor.constraint(equalTo: content.topAnchor, constant: 44)
         NSLayoutConstraint.activate([
             headerTop,
             headerMark.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
-            headerMark.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+            headerMark.centerYAnchor.constraint(equalTo: claudeBtn.centerYAnchor),
             headerMark.widthAnchor.constraint(equalToConstant: 13),
             headerMark.heightAnchor.constraint(equalToConstant: 13),
 
-            headerLabel.leadingAnchor.constraint(equalTo: headerMark.trailingAnchor, constant: 7),
+            claudeBtn.leadingAnchor.constraint(equalTo: headerMark.trailingAnchor, constant: 5),
+
+            codexIcon.leadingAnchor.constraint(equalTo: claudeBtn.trailingAnchor, constant: 12),
+            codexIcon.centerYAnchor.constraint(equalTo: claudeBtn.centerYAnchor),
+            codexIcon.widthAnchor.constraint(equalToConstant: 12),
+            codexIcon.heightAnchor.constraint(equalToConstant: 12),
+
+            codexBtn.leadingAnchor.constraint(equalTo: codexIcon.trailingAnchor, constant: 5),
+            codexBtn.firstBaselineAnchor.constraint(equalTo: claudeBtn.firstBaselineAnchor),
 
             collapseButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -13),
-            collapseButton.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+            collapseButton.centerYAnchor.constraint(equalTo: claudeBtn.centerYAnchor),
 
             headerCounts.trailingAnchor.constraint(equalTo: collapseButton.leadingAnchor, constant: -8),
-            headerCounts.firstBaselineAnchor.constraint(equalTo: headerLabel.firstBaselineAnchor),
-            headerCounts.leadingAnchor.constraint(greaterThanOrEqualTo: headerLabel.trailingAnchor, constant: 8),
+            headerCounts.firstBaselineAnchor.constraint(equalTo: claudeBtn.firstBaselineAnchor),
+            headerCounts.leadingAnchor.constraint(greaterThanOrEqualTo: codexBtn.trailingAnchor, constant: 8),
 
             rowsStack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 6),
             rowsStack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -6),
@@ -1143,7 +1290,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // These force a tall minimum window height — deactivated in island mode.
         expandedConstraints = [
-            rowsStack.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 8),
+            rowsStack.topAnchor.constraint(equalTo: claudeBtn.bottomAnchor, constant: 8),
             footerLabel.topAnchor.constraint(equalTo: rowsStack.bottomAnchor, constant: 6),
             footerLabel.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -8),
         ]
@@ -1190,6 +1337,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             panel.level = .floating
             applyMask(rect: NSRect(origin: .zero, size: panel.frame.size),
                       bottomRadius: 14, animated: false)
+            // Re-layout NOW: the card would otherwise keep the notch-mode top
+            // inset (a big blank strip above the header) until the next poll,
+            // then visibly snap.
+            positionExpanded(rows: sortedForDisplay(lastSessions), animate: false)
         }
         scheduleDropCheck()
     }
@@ -1216,10 +1367,14 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func refresh() {
         if paused { return }
+        let src = source
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
-            let result = self.dataSource.fetch()
+            let result = src == .codex ? self.dataSource.fetchCodex() : self.dataSource.fetch()
             DispatchQueue.main.async {
+                // A slow fetch from before a source switch must not paint the
+                // other CLI's sessions.
+                guard self.source == src else { return }
                 self.apply(result)
             }
         }
@@ -1271,8 +1426,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         // constraints would force a minimum window size and block the small
         // island frame. Counts still update below via the header summary.
         if isCollapsed {
-            for v in rowsStack.arrangedSubviews {
-                rowsStack.removeArrangedSubview(v)
+            // Sweep SUBVIEWS, not arrangedSubviews — an orphaned row (subview
+            // the stack no longer arranges) would otherwise survive here,
+            // outlive rowViews.removeAll(), and paint stale content over live
+            // rows on the next expand. removeFromSuperview alone suffices:
+            // the stack drops removed subviews from its arrangement.
+            for v in rowsStack.subviews.compactMap({ $0 as? RowView }) {
                 v.removeFromSuperview()
             }
             rowViews.removeAll()
@@ -1281,16 +1440,24 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Duplicate session ids (e.g. one session listed twice by the daemon)
+        // would put the same RowView into the stack twice and corrupt its
+        // constraint chain — rows then pile up at the same y.
+        var seenIds = Set<String>()
+        let unique = sorted.filter { seenIds.insert($0.sessionId).inserted }
+        if unique.count != sorted.count {
+            dbg("render: dropped \(sorted.count - unique.count) duplicate session row(s)")
+        }
+
         // Diff rows by sessionId to preserve pulse animation continuity.
-        let liveIds = Set(sorted.map { $0.sessionId })
+        let liveIds = Set(unique.map { $0.sessionId })
         for (sid, view) in rowViews where !liveIds.contains(sid) {
-            rowsStack.removeArrangedSubview(view)
             view.removeFromSuperview()
             rowViews.removeValue(forKey: sid)
         }
 
         var ordered: [RowView] = []
-        for s in sorted {
+        for s in unique {
             let row: RowView
             if let existing = rowViews[s.sessionId] {
                 existing.update(session: s)
@@ -1309,7 +1476,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         for v in rowsStack.arrangedSubviews { rowsStack.removeArrangedSubview(v) }
         for v in ordered {
             rowsStack.addArrangedSubview(v)
-            v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor).isActive = true
+            if v.widthConstraint == nil {
+                v.widthConstraint = v.widthAnchor.constraint(equalTo: rowsStack.widthAnchor)
+            }
+            v.widthConstraint?.isActive = true
+        }
+        // Heal orphans: any row subview the stack no longer arranges keeps a
+        // stale frame and overlaps live rows. Log it — it's a bug upstream.
+        let keep = Set(ordered.map { ObjectIdentifier($0) })
+        for v in rowsStack.subviews.compactMap({ $0 as? RowView }) where !keep.contains(ObjectIdentifier(v)) {
+            dbg("render: healed orphaned row \(v.sessionId.prefix(12)) (\(v.session.name.prefix(24)))")
+            v.removeFromSuperview()
         }
 
         updateHeaderCounts(sorted: sorted)
