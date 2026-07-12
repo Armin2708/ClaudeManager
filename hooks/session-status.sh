@@ -68,6 +68,9 @@ write_status() {
 }
 
 case "$EVENT" in
+  SessionStart)
+    update_file '.status = "idle" | .children = []'
+    ;;
   UserPromptSubmit)
     # New turn: reset children (fresh turn starts clean).
     update_file '.status = "working" | .children = []'

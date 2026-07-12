@@ -59,3 +59,12 @@ Click also rewrites done_unseen → idle (seen). One-time macOS Automation permi
 - `claude agents` failing → keep last state, show "daemon unreachable" footer.
 - Hook: never blocks Claude Code, exits 0 always.
 - Tests: pipe-test hook with synthetic payloads per event; drive panel with fake status dir; live end-to-end.
+
+## 7. v1.2 session-management extension (2026-07-12)
+
+- Row context menus add Focus, Interrupt (`SIGINT`), confirmed Terminate (`SIGTERM`), persistent panel labels, and copyable resume commands. PID ownership is revalidated immediately before a signal is sent.
+- Recently observed stable session IDs are retained locally for 30 days; a background-menu toggle shows up to eight recent rows per source. Clicking a recent row launches the documented `claude --resume <id>` or `codex resume <id>` command in Terminal/iTerm.
+- Codex lifecycle hooks in `~/.codex/hooks.json` overlay process discovery with stable IDs and rich status: SessionStart→idle, UserPromptSubmit/PreToolUse→working, PermissionRequest→waiting, failed PostToolUse→error, Stop→done-unseen, plus subagent lifecycle rows. Hooks require one-time trust through Codex `/hooks`; CPU remains the fallback.
+- Terminal.app focus now matches the process TTY before falling back to title. Warp, WezTerm, kitty, and Alacritty receive best-available window focus through process ancestry and Accessibility.
+- Packaging strips extended attributes and resource forks before signing, prevents AppleDouble entries, then extracts and verifies the final ZIP. The installer verifies before replacing an existing app.
+- `tests/run.sh` is the release gate, mirrored by macOS GitHub Actions: Swift typecheck/compile, shell syntax, Claude/Codex hook lifecycle, installer idempotence, snapshot mapping, resume commands, guarded process control, package extraction, and signature verification.

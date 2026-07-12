@@ -13,8 +13,10 @@ A native macOS panel that lives in and under your MacBook notch and shows every 
 - **Click a row** to jump to that session: exact iTerm2 tab (matched by tty), Terminal, VS Code / PyCharm project window
 - **CLAUDE / CODEX** toggle in the header — also shows live OpenAI Codex CLI sessions
 - Subagents appear nested inline under their parent session
+- **Right-click a session** to focus, interrupt the current turn, terminate it safely, rename its panel label, or copy its resume command
+- Optional recent-session rows let you resume finished Claude or Codex sessions in a new terminal tab
 - Header counts (`2 working · 1 waiting`); panel dims when everything is idle
-- Right-click: Install Claude Code Hooks… · Pause updates · Launch at Login · Quit
+- Background right-click: install Claude/Codex tracking · show recent sessions · pause updates · launch at login · quit
 
 ## Install (30 seconds)
 
@@ -33,23 +35,31 @@ Downloads the latest release, installs to `~/Applications`, removes the quaranti
 1. Download `ClaudeSessions.zip` from the [Releases page](https://github.com/Armin2708/ClaudeManager/releases)
 2. Unzip and move `ClaudeSessions.app` to Applications
 3. **Right-click the app → Open** the first time (needed once because the app is ad-hoc signed, not notarized, so Gatekeeper quarantines the download)
-4. Click **"Install Hooks"** when the app prompts
+4. Click **"Install Tracking"** when the app prompts
 
-Either way, on first launch the app offers to register its Claude Code hooks in `~/.claude/settings.json` (backing it up to `settings.json.bak` first). You can re-run this anytime from the right-click menu ("Install Claude Code Hooks…").
+Either way, on first launch the app offers to register lifecycle tracking for both CLIs:
+
+- Claude Code hooks in `~/.claude/settings.json`
+- Codex hooks in `~/.codex/hooks.json`
+
+Both files are backed up before modification. Codex requires one additional trust step: run `/hooks` inside Codex and approve the new ClaudeSessions entries. Until then, Codex discovery still works with the process/CPU fallback.
 
 ## Permissions
 
-- **Automation → iTerm2** (prompted on first click / title fetch): tab titles and exact-tab focus. The app is ad-hoc signed, so rebuilding re-prompts once.
+- **Automation → iTerm2 / Terminal** (prompted on first click / resume): exact-tab focus and opening resumed sessions. The app is ad-hoc signed, so rebuilding re-prompts once.
 - **Accessibility** (optional): exact-window raising when VS Code/PyCharm has several windows open.
 
 ## How it works
 
-Two parts, one contract:
+Three parts, one contract:
 
-1. **Hook** — the app binary doubles as the Claude Code hook: `ClaudeSessions --hook` reads the hook JSON on stdin and writes one status file per session to `~/.claude/session-status/<session_id>.json`. It's registered for 7 events (`UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`, `SessionEnd`, `SubagentStart`, `SubagentStop`). The `Stop` handler only marks **Done** when the session is genuinely finished (no running background tasks, no scheduled wakeups).
+1. **Lifecycle hooks** — the app binary handles both `--hook` (Claude) and `--codex-hook`. Claude writes to `~/.claude/session-status/`; Codex writes to `~/.codex/session-status/`. Events cover startup, prompts, permission waits, tools, stops, failures, session end, and subagents. Claude's `Stop` handler only marks **Done** when the session is genuinely finished (no running background tasks or scheduled wakeups).
 2. **Panel** (`src/main.swift`, single-file AppKit) — polls `claude agents --json` every 2s for live sessions, overlays the hook statuses, reaps stale files.
+3. **Local history** — recently observed resumable IDs and optional panel labels live in `~/Library/Application Support/ClaudeSessions/recent-sessions.json`. This is local-only and stores no transcript content.
 
-Codex sessions need no hooks at all — the panel finds live OpenAI Codex CLI sessions via a process scan.
+Codex sessions remain visible without hooks through an interactive-process scan. With hooks installed and trusted, they gain stable IDs plus working, waiting, error, done, and subagent state instead of the CPU-only approximation.
+
+Live management is deliberately process-safe: **Interrupt** sends `SIGINT` only after re-validating that the PID is still a Claude/Codex process; **Terminate** confirms first and sends `SIGTERM`. Resume uses the documented `claude --resume <id>` or `codex resume <id>` command in Terminal/iTerm.
 
 ## For developers
 
@@ -59,9 +69,12 @@ cd ClaudeManager
 bash scripts/build.sh       # compile + assemble the .app
 bash scripts/package.sh     # build + produce dist/ClaudeSessions.zip
 bash scripts/make-icon.sh   # regenerate assets/ClaudeSessions.icns
+bash tests/run.sh           # compile + hooks + actions + package/install verification
 ```
 
-Prefer a shell hook instead of the built-in binary hook? The bash route still works (requires `jq`): symlink `hooks/session-status.sh` to `~/.claude/hooks/` and register it for the same events in `~/.claude/settings.json`. The app detects either install.
+`scripts/package.sh` rejects AppleDouble metadata, extracts the finished ZIP, and verifies the app's resource seal before succeeding.
+
+Prefer a shell hook for Claude instead of the built-in binary hook? The bash route still works (requires `jq`): symlink `hooks/session-status.sh` to `~/.claude/hooks/` and register it for the same events in `~/.claude/settings.json`. The app detects either install.
 
 Design spec: `docs/superpowers/specs/2026-07-09-claude-sessions-panel-design.md`
 

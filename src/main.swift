@@ -2,6 +2,7 @@
 // Single-file AppKit app. See docs/superpowers/specs/2026-07-09-claude-sessions-panel-design.md
 
 import AppKit
+import Darwin
 import Foundation
 import QuartzCore
 #if canImport(ServiceManagement)
@@ -10,13 +11,14 @@ import ServiceManagement
 
 // MARK: - Model
 
-enum SessionStatus: Int {
+enum SessionStatus: Int, Codable {
     // Ordered by sort priority (lower sorts first).
     case error = 0
     case waiting = 1
     case working = 2
     case doneUnseen = 3
     case idle = 4
+    case inactive = 5
 
     init(fileString s: String) {
         switch s {
@@ -35,6 +37,7 @@ enum SessionStatus: Int {
         case .working: return "Working"
         case .doneUnseen: return "Done"
         case .idle: return "Idle"
+        case .inactive: return "Recent"
         }
     }
 
@@ -45,16 +48,24 @@ enum SessionStatus: Int {
         case .working: return .systemGreen
         case .doneUnseen: return .systemOrange
         case .idle: return NSColor.systemGray
+        case .inactive: return NSColor.systemGray
         }
     }
 }
 
+enum SessionSource: String, Codable {
+    case claude
+    case codex
+
+    var displayName: String { rawValue.uppercased() }
+}
+
 struct Session {
     let sessionId: String
-    let name: String
+    var name: String
     let cwd: String
     let pid: Int
-    let status: SessionStatus
+    var status: SessionStatus
     // True when the effective status came from a hook status file (overlay).
     let fromFile: Bool
     // Set when this session's process is a descendant of another live
@@ -63,14 +74,44 @@ struct Session {
     var parentId: String? = nil
     // SF Symbol override for synthetic child rows ("person" / "terminal").
     var childGlyph: String? = nil
+    let source: SessionSource
+    let resumeId: String?
+    let isLive: Bool
+    let lastActivity: TimeInterval
+    let hostHint: HostApp?
+
+    init(sessionId: String, name: String, cwd: String, pid: Int,
+         status: SessionStatus, fromFile: Bool,
+         parentId: String? = nil, childGlyph: String? = nil,
+         source: SessionSource = .claude, resumeId: String? = nil,
+         isLive: Bool = true,
+         lastActivity: TimeInterval = Date().timeIntervalSince1970,
+         hostHint: HostApp? = nil) {
+        self.sessionId = sessionId
+        self.name = name
+        self.cwd = cwd
+        self.pid = pid
+        self.status = status
+        self.fromFile = fromFile
+        self.parentId = parentId
+        self.childGlyph = childGlyph
+        self.source = source
+        self.resumeId = resumeId
+        self.isLive = isLive
+        self.lastActivity = lastActivity
+        self.hostHint = hostHint
+    }
+
+    var stableId: String { resumeId ?? sessionId }
+    var isSyntheticChild: Bool { childGlyph != nil }
 }
 
-enum HostApp {
-    case iterm, terminal, vscode, pycharm, unknown
+enum HostApp: String, Codable {
+    case iterm, terminal, vscode, pycharm, warp, wezterm, kitty, alacritty, unknown
 
     var glyphSymbol: String {
         switch self {
-        case .iterm, .terminal: return "terminal"
+        case .iterm, .terminal, .warp, .wezterm, .kitty, .alacritty: return "terminal"
         case .vscode: return "chevron.left.forwardslash.chevron.right"
         case .pycharm: return "hammer"
         case .unknown: return "app.dashed"
@@ -82,6 +123,10 @@ enum HostApp {
         case .terminal: return "Terminal"
         case .vscode: return "Visual Studio Code"
         case .pycharm: return "PyCharm"
+        case .warp: return "Warp"
+        case .wezterm: return "WezTerm"
+        case .kitty: return "kitty"
+        case .alacritty: return "Alacritty"
         case .unknown: return nil
         }
     }
@@ -90,15 +135,32 @@ enum HostApp {
 // MARK: - Environment / paths
 
 enum Env {
-    static var statusDir: String {
-        if let override = ProcessInfo.processInfo.environment["SESSION_STATUS_DIR"], !override.isEmpty {
+    static func statusDir(for source: SessionSource) -> String {
+        let key = source == .claude ? "SESSION_STATUS_DIR" : "CODEX_SESSION_STATUS_DIR"
+        if let override = ProcessInfo.processInfo.environment[key], !override.isEmpty {
             return (override as NSString).expandingTildeInPath
         }
-        return (NSHomeDirectory() as NSString).appendingPathComponent(".claude/session-status")
+        let relative = source == .claude ? ".claude/session-status" : ".codex/session-status"
+        return (NSHomeDirectory() as NSString).appendingPathComponent(relative)
     }
+    static var statusDir: String { statusDir(for: .claude) }
     static var agentsCmdOverride: String? {
         if let c = ProcessInfo.processInfo.environment["CLAUDE_AGENTS_CMD"], !c.isEmpty { return c }
         return nil
+    }
+    static var codexPsCmdOverride: String? {
+        ProcessInfo.processInfo.environment["CODEX_PS_CMD"]
+    }
+    static var codexCwdOverride: String? {
+        ProcessInfo.processInfo.environment["CODEX_CWD_OVERRIDE"]
+    }
+    static var historyPath: String {
+        if let override = ProcessInfo.processInfo.environment["CLAUDE_SESSIONS_HISTORY_PATH"],
+           !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
+        }
+        return (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Application Support/ClaudeSessions/recent-sessions.json")
     }
 }
 
@@ -125,16 +187,47 @@ func runProcess(_ launchPath: String, _ args: [String], timeout: TimeInterval = 
     let outPipe = Pipe()
     p.standardOutput = outPipe
     p.standardError = Pipe()
+    let lock = NSLock()
+    var data = Data()
+    outPipe.fileHandleForReading.readabilityHandler = { handle in
+        let chunk = handle.availableData
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+    let finished = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in finished.signal() }
     do {
         try p.run()
     } catch {
+        outPipe.fileHandleForReading.readabilityHandler = nil
         return nil
     }
-    // Read fully then wait to avoid pipe deadlock on large output.
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    let s = String(data: data, encoding: .utf8) ?? ""
-    return (s, p.terminationStatus)
+    var timedOut = false
+    if finished.wait(timeout: .now() + timeout) == .timedOut {
+        timedOut = true
+        p.terminate()
+        if finished.wait(timeout: .now() + 1) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+            if finished.wait(timeout: .now() + 1) == .timedOut {
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                outPipe.fileHandleForReading.closeFile()
+                lock.lock()
+                let captured = data
+                lock.unlock()
+                return (String(data: captured, encoding: .utf8) ?? "", 124)
+            }
+        }
+    }
+    outPipe.fileHandleForReading.readabilityHandler = nil
+    let tail = outPipe.fileHandleForReading.readDataToEndOfFile()
+    lock.lock()
+    data.append(tail)
+    let captured = data
+    lock.unlock()
+    let s = String(data: captured, encoding: .utf8) ?? ""
+    return (s, timedOut ? 124 : p.terminationStatus)
 }
 
 // MARK: - Claude binary resolution
@@ -148,6 +241,11 @@ final class ClaudeLocator {
     }
 
     private func resolve() {
+        if let override = ProcessInfo.processInfo.environment["CLAUDE_BIN_OVERRIDE"],
+           FileManager.default.isExecutableFile(atPath: override) {
+            path = override
+            return
+        }
         // 1. `which claude` via a login shell (picks up user PATH).
         if let r = runProcess("/bin/zsh", ["-lc", "which claude"]), r.code == 0 {
             let candidate = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -172,11 +270,42 @@ final class ClaudeLocator {
     }
 }
 
+final class CodexLocator {
+    static let shared = CodexLocator()
+    private(set) var path: String?
+
+    private init() { resolve() }
+
+    private func resolve() {
+        if let override = ProcessInfo.processInfo.environment["CODEX_BIN_OVERRIDE"],
+           FileManager.default.isExecutableFile(atPath: override) {
+            path = override
+            return
+        }
+        if let r = runProcess("/bin/zsh", ["-lc", "which codex"]), r.code == 0 {
+            let candidate = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty, FileManager.default.isExecutableFile(atPath: candidate) {
+                path = candidate
+                return
+            }
+        }
+        let home = NSHomeDirectory()
+        let candidates = [
+            "\(home)/.local/bin/codex",
+            "\(home)/.npm-global/bin/codex",
+            "/usr/local/bin/codex",
+            "/opt/homebrew/bin/codex",
+        ]
+        path = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+}
+
 // MARK: - Host app detection (process ancestry)
 
 final class HostResolver {
     static let shared = HostResolver()
     private var cache: [Int: (host: HostApp, hostPid: Int?)] = [:]
+    private let cacheLock = NSLock()
 
     func host(forPid pid: Int) -> HostApp {
         return resolve(pid).host
@@ -187,33 +316,50 @@ final class HostResolver {
     }
 
     private func resolve(_ pid: Int) -> (host: HostApp, hostPid: Int?) {
-        if let cached = cache[pid] { return cached }
+        cacheLock.lock()
+        let cached = cache[pid]
+        cacheLock.unlock()
+        if let cached { return cached }
         var current = pid
         var result: (host: HostApp, hostPid: Int?) = (.unknown, nil)
         for _ in 0..<16 {
             guard current > 1, let info = procInfo(current) else { break }
             let comm = (info.comm as NSString).lastPathComponent.lowercased()
             if comm.contains("iterm") { result = (.iterm, current); break }
+            if comm.contains("warp") { result = (.warp, current); break }
+            if comm.contains("wezterm") { result = (.wezterm, current); break }
+            if comm == "kitty" { result = (.kitty, current); break }
+            if comm.contains("alacritty") { result = (.alacritty, current); break }
             if comm.contains("pycharm") || comm.contains("jetbrains") { result = (.pycharm, current); break }
-            if comm.contains("code") || comm.contains("electron") { result = (.vscode, current); break }
+            if comm == "code" || comm.hasPrefix("code helper") || comm == "electron" {
+                result = (.vscode, current)
+                break
+            }
             if comm == "terminal" { result = (.terminal, current); break }
             if info.ppid <= 1 { result = (.unknown, current); break }
             current = info.ppid
         }
+        cacheLock.lock()
         cache[pid] = result
+        cacheLock.unlock()
         return result
     }
 
     func prune(livePids: Set<Int>) {
+        cacheLock.lock()
         cache = cache.filter { livePids.contains($0.key) }
         ancestorCache = ancestorCache.filter { livePids.contains($0.key) }
+        cacheLock.unlock()
     }
 
     // Ancestor pid chain (nearest first), cached per pid.
     private var ancestorCache: [Int: [Int]] = [:]
 
     func ancestors(of pid: Int) -> [Int] {
-        if let cached = ancestorCache[pid] { return cached }
+        cacheLock.lock()
+        let cached = ancestorCache[pid]
+        cacheLock.unlock()
+        if let cached { return cached }
         var chain: [Int] = []
         var current = pid
         for _ in 0..<24 {
@@ -221,7 +367,9 @@ final class HostResolver {
             chain.append(info.ppid)
             current = info.ppid
         }
+        cacheLock.lock()
         ancestorCache[pid] = chain
+        cacheLock.unlock()
         return chain
     }
 
@@ -329,6 +477,164 @@ final class TitleResolver {
     }
 }
 
+// MARK: - Recent sessions and persistent panel labels
+
+private struct RecentSessionRecord: Codable, Equatable {
+    let source: SessionSource
+    let stableId: String
+    var resumeId: String?
+    var name: String
+    var alias: String?
+    var cwd: String
+    var host: HostApp
+    var lastSeen: TimeInterval
+}
+
+final class RecentSessionStore {
+    static let shared = RecentSessionStore()
+
+    private let path: String
+    private let queue = DispatchQueue(label: "recent-session-store")
+    private var records: [String: RecentSessionRecord] = [:]
+    private var lastDiskWrite = Date.distantPast
+
+    init(path: String = Env.historyPath) {
+        self.path = path
+        if let data = FileManager.default.contents(atPath: path),
+           let decoded = try? JSONDecoder().decode([RecentSessionRecord].self, from: data) {
+            for record in decoded {
+                records[Self.key(source: record.source, id: record.stableId)] = record
+            }
+        }
+    }
+
+    private static func key(source: SessionSource, id: String) -> String {
+        "\(source.rawValue):\(id)"
+    }
+
+    func displayName(for session: Session, fallback: String) -> String {
+        queue.sync {
+            records[Self.key(source: session.source, id: session.stableId)]?.alias ?? fallback
+        }
+    }
+
+    func observe(_ sessions: [Session]) {
+        let now = Date().timeIntervalSince1970
+        queue.sync {
+            var materiallyChanged = false
+            for session in sessions where session.isLive && !session.isSyntheticChild {
+                let key = Self.key(source: session.source, id: session.stableId)
+                let host = session.hostHint ?? HostResolver.shared.host(forPid: session.pid)
+                if var existing = records[key] {
+                    if existing.name != session.name || existing.cwd != session.cwd
+                        || existing.host != host || existing.resumeId != session.resumeId {
+                        materiallyChanged = true
+                    }
+                    existing.name = session.name
+                    existing.cwd = session.cwd
+                    existing.host = host
+                    existing.resumeId = session.resumeId
+                    existing.lastSeen = now
+                    records[key] = existing
+                } else {
+                    records[key] = RecentSessionRecord(
+                        source: session.source,
+                        stableId: session.stableId,
+                        resumeId: session.resumeId,
+                        name: session.name,
+                        alias: nil,
+                        cwd: session.cwd,
+                        host: host,
+                        lastSeen: now)
+                    materiallyChanged = true
+                }
+            }
+            if materiallyChanged || Date().timeIntervalSince(lastDiskWrite) >= 30 {
+                persistLocked()
+            }
+        }
+    }
+
+    func recent(source: SessionSource, excluding liveIds: Set<String>, limit: Int = 8) -> [Session] {
+        queue.sync {
+            let cutoff = Date().timeIntervalSince1970 - 30 * 24 * 60 * 60
+            return records.values
+                .filter {
+                    $0.source == source && $0.lastSeen >= cutoff
+                        && !liveIds.contains($0.stableId) && $0.resumeId != nil
+                }
+                .sorted { $0.lastSeen > $1.lastSeen }
+                .prefix(limit)
+                .map { record in
+                    Session(
+                        sessionId: "recent:\(record.source.rawValue):\(record.stableId)",
+                        name: record.alias ?? record.name,
+                        cwd: record.cwd,
+                        pid: 0,
+                        status: .inactive,
+                        fromFile: false,
+                        source: record.source,
+                        resumeId: record.resumeId,
+                        isLive: false,
+                        lastActivity: record.lastSeen,
+                        hostHint: record.host)
+                }
+        }
+    }
+
+    func rename(_ session: Session, to rawName: String?) -> String {
+        queue.sync {
+            let cleaned = rawName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let alias = cleaned?.isEmpty == false ? cleaned : nil
+            let key = Self.key(source: session.source, id: session.stableId)
+            if var existing = records[key] {
+                existing.alias = alias
+                records[key] = existing
+            } else {
+                records[key] = RecentSessionRecord(
+                    source: session.source,
+                    stableId: session.stableId,
+                    resumeId: session.resumeId,
+                    name: session.name,
+                    alias: alias,
+                    cwd: session.cwd,
+                    host: session.hostHint ?? .unknown,
+                    lastSeen: Date().timeIntervalSince1970)
+            }
+            persistLocked()
+            return alias ?? records[key]?.name ?? session.name
+        }
+    }
+
+    func forget(_ session: Session) {
+        queue.sync {
+            records.removeValue(forKey: Self.key(source: session.source, id: session.stableId))
+            persistLocked()
+        }
+    }
+
+    func clear(source: SessionSource) {
+        queue.sync {
+            records = records.filter { $0.value.source != source }
+            persistLocked()
+        }
+    }
+
+    private func persistLocked() {
+        let fm = FileManager.default
+        let parent = (path as NSString).deletingLastPathComponent
+        try? fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        let sorted = records.values.sorted {
+            if $0.source != $1.source { return $0.source.rawValue < $1.source.rawValue }
+            return $0.lastSeen > $1.lastSeen
+        }
+        if let data = try? JSONEncoder().encode(sorted) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            lastDiskWrite = Date()
+        }
+    }
+}
+
 // MARK: - Data source
 
 final class DataSource {
@@ -360,10 +666,23 @@ final class DataSource {
                 effective = (a.status == "busy") ? .working : .idle
                 fromFile = false
             }
-            sessions.append(Session(sessionId: a.sessionId,
-                                    name: titleBySid[a.sessionId] ?? a.name,
-                                    cwd: a.cwd,
-                                    pid: a.pid, status: effective, fromFile: fromFile))
+            let fallbackName = titleBySid[a.sessionId] ?? a.name
+            let session = Session(
+                sessionId: a.sessionId,
+                name: fallbackName,
+                cwd: a.cwd,
+                pid: a.pid,
+                status: effective,
+                fromFile: fromFile,
+                source: .claude,
+                resumeId: a.sessionId,
+                hostHint: HostResolver.shared.host(forPid: a.pid))
+            sessions.append(session)
+        }
+        RecentSessionStore.shared.observe(sessions)
+        for index in sessions.indices {
+            sessions[index].name = RecentSessionStore.shared.displayName(
+                for: sessions[index], fallback: sessions[index].name)
         }
 
         dbg("overlay titles=\(titleBySid.mapValues { String($0.prefix(20)) })")
@@ -393,19 +712,28 @@ final class DataSource {
                     fromFile: true,
                     parentId: parent.sessionId,
                     childGlyph: ["agent", "teammate", "local_agent"].contains(child.kind)
-                        ? "person.fill" : "gearshape.fill"))
+                        ? "person.fill" : "gearshape.fill",
+                    source: parent.source,
+                    resumeId: parent.resumeId,
+                    hostHint: parent.hostHint))
             }
         }
         return Result(sessions: withChildren, reachable: true)
     }
 
-    // MARK: Codex sessions (process scan — Codex has no hook/status contract)
+    // MARK: Codex sessions (process scan + optional lifecycle-hook overlay)
 
     /// Live Codex CLI sessions: interactive `codex` processes (ones with a
-    /// controlling terminal), cwd via lsof. Status is a CPU heuristic — the
-    /// TUI idles near 0% while waiting for input and burns CPU while working.
+    /// controlling terminal), cwd via lsof. Installed lifecycle hooks provide
+    /// stable IDs and rich status; CPU remains the zero-setup fallback.
     func fetchCodex() -> Result {
-        guard let r = runProcess("/bin/ps", ["-axo", "pid=,ppid=,%cpu=,tty=,command="]), r.code == 0 else {
+        let scan: (out: String, code: Int32)?
+        if let cmd = Env.codexPsCmdOverride, !cmd.isEmpty {
+            scan = runProcess("/bin/zsh", ["-lc", cmd])
+        } else {
+            scan = runProcess("/bin/ps", ["-axo", "pid=,ppid=,%cpu=,tty=,command="])
+        }
+        guard let r = scan, r.code == 0 else {
             return Result(sessions: [], reachable: false)
         }
         struct Proc { let pid: Int; let ppid: Int; let cpu: Double; let tty: String }
@@ -419,7 +747,8 @@ final class DataSource {
             let cmd = String(parts[4])
             guard tty != "??" else { continue }  // interactive sessions only
             let bin = cmd.split(separator: " ").first.map { ($0 as NSString).lastPathComponent } ?? ""
-            let isCodex = bin == "codex" || (bin == "node" && cmd.contains("/codex"))
+            let isCodex = bin == "codex" || bin.hasPrefix("codex-")
+                || (bin == "node" && cmd.contains("/codex"))
             guard isCodex else { continue }
             procs.append(Proc(pid: pid, ppid: ppid, cpu: cpu, tty: tty))
         }
@@ -427,22 +756,68 @@ final class DataSource {
         let pids = Set(procs.map { $0.pid })
         procs.removeAll { pids.contains($0.ppid) }
 
+        let livePids = Set(procs.map { $0.pid })
+        HostResolver.shared.prune(livePids: livePids)
         TitleResolver.shared.refresh(pids: procs.map { $0.pid })
+        let statusByPid = loadCodexStatusFiles(livePids: livePids)
         var sessions: [Session] = []
         for p in procs {
             let cwd = cwdOf(pid: p.pid)
             let folder = (cwd as NSString).lastPathComponent
-            sessions.append(Session(sessionId: "codex-\(p.pid)",
-                                    name: folder.isEmpty ? "codex" : folder,
-                                    cwd: cwd,
-                                    pid: p.pid,
-                                    status: p.cpu > 8 ? .working : .idle,
-                                    fromFile: false))
+            let candidate = statusByPid[p.pid]
+            let snapshot: CodexStatusSnapshot?
+            if let candidate, !candidate.cwd.isEmpty, !cwd.isEmpty,
+               (candidate.cwd as NSString).standardizingPath != (cwd as NSString).standardizingPath {
+                snapshot = nil // PID was reused by a different Codex session.
+            } else {
+                snapshot = candidate
+            }
+            let sid = snapshot?.sessionId ?? "codex-\(p.pid)"
+            let fallbackName = snapshot?.title ?? (folder.isEmpty ? "codex" : folder)
+            let resolvedCwd = snapshot.flatMap { $0.cwd.isEmpty ? nil : $0.cwd } ?? cwd
+            let session = Session(
+                sessionId: sid,
+                name: fallbackName,
+                cwd: resolvedCwd,
+                pid: p.pid,
+                status: snapshot?.status ?? (p.cpu > 8 ? .working : .idle),
+                fromFile: snapshot != nil,
+                source: .codex,
+                resumeId: snapshot == nil ? nil : sid,
+                lastActivity: snapshot?.updatedAt ?? Date().timeIntervalSince1970,
+                hostHint: HostResolver.shared.host(forPid: p.pid))
+            sessions.append(session)
         }
-        return Result(sessions: sessions, reachable: true)
+        RecentSessionStore.shared.observe(sessions)
+        for index in sessions.indices {
+            sessions[index].name = RecentSessionStore.shared.displayName(
+                for: sessions[index], fallback: sessions[index].name)
+        }
+
+        var withChildren = sessions
+        for parent in sessions {
+            guard let snapshot = statusByPid[parent.pid] else { continue }
+            for child in snapshot.children {
+                withChildren.append(Session(
+                    sessionId: "\(parent.sessionId)#\(child.id)",
+                    name: child.name,
+                    cwd: parent.cwd,
+                    pid: parent.pid,
+                    status: .working,
+                    fromFile: true,
+                    parentId: parent.sessionId,
+                    childGlyph: "person.fill",
+                    source: .codex,
+                    resumeId: parent.resumeId,
+                    lastActivity: snapshot.updatedAt,
+                    hostHint: parent.hostHint))
+            }
+        }
+        return Result(sessions: withChildren, reachable: true)
     }
 
     private func cwdOf(pid: Int) -> String {
+        if let override = Env.codexCwdOverride { return override }
         guard let r = runProcess("/usr/sbin/lsof", ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]),
               r.code == 0 else { return "" }
         for line in r.out.split(separator: "\n") where line.hasPrefix("n") {
@@ -485,6 +860,15 @@ final class DataSource {
         let name: String
     }
 
+    private struct CodexStatusSnapshot {
+        let sessionId: String
+        let status: SessionStatus
+        let cwd: String
+        let title: String?
+        let updatedAt: TimeInterval
+        let children: [ChildInfo]
+    }
+
     private var childrenBySid: [String: [ChildInfo]] = [:]
     // Session topic titles extracted by the hook from transcript ai-title
     // entries — host-app agnostic (works for VS Code/PyCharm terminals too).
@@ -522,6 +906,171 @@ final class DataSource {
             }
         }
         return overlay
+    }
+
+    private func loadCodexStatusFiles(livePids: Set<Int>) -> [Int: CodexStatusSnapshot] {
+        var result: [Int: CodexStatusSnapshot] = [:]
+        let fm = FileManager.default
+        let dir = Env.statusDir(for: .codex)
+        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return result }
+        let staleCutoff = Date().timeIntervalSince1970 - 7 * 24 * 60 * 60
+        for file in files where file.hasSuffix(".json") {
+            let full = (dir as NSString).appendingPathComponent(file)
+            guard let data = fm.contents(atPath: full),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let sid = obj["session_id"] as? String else { continue }
+            let jsonUpdatedAt = (obj["updated_at"] as? NSNumber)?.doubleValue ?? 0
+            let modifiedAt = ((try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date)?
+                .timeIntervalSince1970 ?? 0
+            let updatedAt = max(jsonUpdatedAt, modifiedAt)
+            guard let pid = (obj["pid"] as? NSNumber)?.intValue else {
+                if updatedAt < staleCutoff { try? fm.removeItem(atPath: full) }
+                continue
+            }
+            if !livePids.contains(pid) {
+                if updatedAt < staleCutoff { try? fm.removeItem(atPath: full) }
+                continue
+            }
+            let children = ((obj["children"] as? [[String: Any]]) ?? []).compactMap { child -> ChildInfo? in
+                guard let id = child["id"] as? String else { return nil }
+                return ChildInfo(id: id,
+                                 kind: (child["kind"] as? String) ?? "agent",
+                                 name: (child["name"] as? String) ?? "subagent")
+            }
+            let snapshot = CodexStatusSnapshot(
+                sessionId: sid,
+                status: SessionStatus(fileString: (obj["status"] as? String) ?? "idle"),
+                cwd: (obj["cwd"] as? String) ?? "",
+                title: obj["title"] as? String,
+                updatedAt: updatedAt,
+                children: children)
+            if result[pid] == nil || updatedAt > result[pid]!.updatedAt {
+                result[pid] = snapshot
+            }
+        }
+        return result
+    }
+}
+
+// MARK: - Session management
+
+enum SessionControlError: LocalizedError {
+    case notLive
+    case staleProcess
+    case signalFailed(Int32)
+    case missingResumeId
+    case missingCLI(SessionSource)
+    case launchFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notLive: return "That session is no longer running."
+        case .staleProcess: return "The process no longer belongs to this session. Refresh and try again."
+        case .signalFailed(let code): return "macOS rejected the session signal (errno \(code))."
+        case .missingResumeId: return "This session started before lifecycle tracking was enabled, so it has no resumable ID yet."
+        case .missingCLI(let source): return "The \(source.displayName) CLI could not be found in your PATH."
+        case .launchFailed(let message): return "The terminal could not launch the session: \(message)"
+        }
+    }
+}
+
+enum SessionControl {
+    static func interrupt(_ session: Session) -> Result<Void, SessionControlError> {
+        send(SIGINT, to: session)
+    }
+
+    static func terminate(_ session: Session) -> Result<Void, SessionControlError> {
+        send(SIGTERM, to: session)
+    }
+
+    private static func send(_ signal: Int32, to session: Session) -> Result<Void, SessionControlError> {
+        guard session.isLive, session.pid > 1 else { return .failure(.notLive) }
+        guard processMatches(session) else { return .failure(.staleProcess) }
+        guard Darwin.kill(pid_t(session.pid), signal) == 0 else {
+            return .failure(.signalFailed(errno))
+        }
+        return .success(())
+    }
+
+    private static func processMatches(_ session: Session) -> Bool {
+        guard let r = runProcess("/bin/ps", ["-o", "command=", "-p", "\(session.pid)"], timeout: 2),
+              r.code == 0 else { return false }
+        let command = r.out.lowercased()
+        switch session.source {
+        case .claude: return command.contains("claude")
+        case .codex: return command.contains("codex")
+        }
+    }
+}
+
+enum ResumeCommandBuilder {
+    static func command(for session: Session) -> Result<String, SessionControlError> {
+        guard let resumeId = session.resumeId, !resumeId.isEmpty else {
+            return .failure(.missingResumeId)
+        }
+        let executable: String
+        let args: [String]
+        switch session.source {
+        case .claude:
+            guard let path = ClaudeLocator.shared.path else { return .failure(.missingCLI(.claude)) }
+            executable = path
+            args = ["--resume", resumeId]
+        case .codex:
+            guard let path = CodexLocator.shared.path else { return .failure(.missingCLI(.codex)) }
+            executable = path
+            args = ["resume", resumeId]
+        }
+        let invocation = ([executable] + args).map(shellQuote).joined(separator: " ")
+        return .success("cd \(shellQuote(session.cwd)) && exec \(invocation)")
+    }
+
+    static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+enum TerminalLauncher {
+    static func resume(_ session: Session) -> Result<Void, SessionControlError> {
+        switch ResumeCommandBuilder.command(for: session) {
+        case .failure(let error): return .failure(error)
+        case .success(let command):
+            let host = session.hostHint ?? .terminal
+            let script: String
+            if host == .iterm,
+               NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.googlecode.iterm2") != nil {
+                script = """
+                tell application "iTerm2"
+                    activate
+                    if (count of windows) is 0 then
+                        create window with default profile command "\(escapeAppleScript(command))"
+                    else
+                        tell current window to create tab with default profile command "\(escapeAppleScript(command))"
+                    end if
+                end tell
+                """
+            } else {
+                script = """
+                tell application "Terminal"
+                    activate
+                    do script "\(escapeAppleScript(command))"
+                end tell
+                """
+            }
+            var error: NSDictionary?
+            guard let appleScript = NSAppleScript(source: script) else {
+                return .failure(.launchFailed("invalid AppleScript"))
+            }
+            _ = appleScript.executeAndReturnError(&error)
+            if let error {
+                return .failure(.launchFailed(error.description))
+            }
+            return .success(())
+        }
+    }
+
+    private static func escapeAppleScript(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }
 
@@ -625,7 +1174,7 @@ final class StatusBar: NSView {
         layer?.removeAnimation(forKey: "pulse")
         layer?.opacity = 1
         layer?.backgroundColor = status.color
-            .withAlphaComponent(status == .idle ? 0.35 : 1.0).cgColor
+            .withAlphaComponent(status == .idle || status == .inactive ? 0.35 : 1.0).cgColor
         if status == .working {
             let a = CABasicAnimation(keyPath: "opacity")
             a.fromValue = 1.0
@@ -656,6 +1205,7 @@ final class RowView: NSView {
     // re-add instead of leaking a fresh duplicate every refresh.
     var widthConstraint: NSLayoutConstraint?
     var onClick: ((RowView) -> Void)?
+    var onMenu: ((RowView) -> NSMenu?)?
 
     init(session: Session) {
         self.sessionId = session.sessionId
@@ -734,11 +1284,14 @@ final class RowView: NSView {
             : (TitleResolver.shared.title(for: session) ?? session.name)
         nameLabel.stringValue = title
         nameLabel.font = Theme.display(isChild ? 11 : 13, isChild ? .medium : .semibold)
-        nameLabel.textColor = isChild ? .secondaryLabelColor : .labelColor
+        nameLabel.textColor = isChild || !session.isLive ? .secondaryLabelColor : .labelColor
         // Children show what they are instead of the repo path; parents show
         // the home-relative path in mono.
         if isChild {
             projectLabel.stringValue = session.childGlyph == "person.fill" ? "agent" : "task"
+        } else if !session.isLive {
+            let relative = Self.relativeAge(since: session.lastActivity)
+            projectLabel.stringValue = "\((session.cwd as NSString).lastPathComponent) · \(relative)"
         } else {
             let home = NSHomeDirectory()
             projectLabel.stringValue = session.cwd.hasPrefix(home)
@@ -754,9 +1307,19 @@ final class RowView: NSView {
                 .foregroundColor: session.status.color,
             ])
         let symbol = session.childGlyph
-            ?? HostResolver.shared.host(forPid: session.pid).glyphSymbol
+            ?? (session.isLive
+                ? HostResolver.shared.host(forPid: session.pid).glyphSymbol
+                : "clock.arrow.circlepath")
         glyph.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         applyBackground()
+    }
+
+    private static func relativeAge(since timestamp: TimeInterval) -> String {
+        let seconds = max(0, Date().timeIntervalSince1970 - timestamp)
+        if seconds < 60 { return "just now" }
+        if seconds < 3600 { return "\(Int(seconds / 60))m ago" }
+        if seconds < 86_400 { return "\(Int(seconds / 3600))h ago" }
+        return "\(Int(seconds / 86_400))d ago"
     }
 
     private func applyBackground() {
@@ -785,6 +1348,8 @@ final class RowView: NSView {
         // Single click focuses. Right-click handled via menu(for:).
         onClick?(self)
     }
+
+    override func menu(for event: NSEvent) -> NSMenu? { onMenu?(self) }
 }
 
 // MARK: - Panel content view
@@ -842,20 +1407,33 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var rowsStack: NSStackView!
     private var timer: Timer?
     private let dataSource = DataSource()
+    private let recentStore = RecentSessionStore.shared
+    private let refreshQueue = DispatchQueue(label: "session-refresh")
+    private var refreshInFlight = false
 
     private var rowViews: [String: RowView] = [:]
     private var paused = false
     private var lastReachable = true
     private var lastSessions: [Session] = []
+    private var liveSessions: [Session] = []
     private var hadFirstData = false
+    private var showRecent = ProcessInfo.processInfo.environment["CLAUDE_SESSIONS_SHOW_RECENT"] == "1"
+        || UserDefaults.standard.bool(forKey: "ShowRecentSessions")
 
     // Which CLI's sessions the panel shows.
-    private enum SessionSource: Int { case claude = 0, codex = 1 }
-    private var source = SessionSource(
-        rawValue: UserDefaults.standard.integer(forKey: "SessionSource")) ?? .claude
+    private var source: SessionSource = {
+        if let raw = ProcessInfo.processInfo.environment["CLAUDE_SESSIONS_SOURCE"],
+           let source = SessionSource(rawValue: raw) { return source }
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: "SessionSource"),
+           let source = SessionSource(rawValue: raw) { return source }
+        // Migrate the v1.1 integer preference (0 = Claude, 1 = Codex).
+        return defaults.integer(forKey: "SessionSource") == 1 ? .codex : .claude
+    }()
 
     // Island (collapsed) mode — a small capsule docked beside the notch.
-    private(set) var isCollapsed = UserDefaults.standard.bool(forKey: "IslandCollapsed")
+    private(set) var isCollapsed = ProcessInfo.processInfo.environment["CLAUDE_SESSIONS_FORCE_EXPANDED"] == "1"
+        ? false : UserDefaults.standard.bool(forKey: "IslandCollapsed")
     // Constraints that only apply expanded (they force a tall minimum height).
     private var expandedConstraints: [NSLayoutConstraint] = []
     // Hardware-notch shape mask applied to the island.
@@ -881,36 +1459,63 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// Plug-and-play: a downloaded app offers to register its own hook
     /// entries on first launch instead of pointing users at the README.
     private func offerHookInstallIfNeeded() {
-        guard !HookInstaller.isInstalled(),
-              !UserDefaults.standard.bool(forKey: "HookInstallDeclined") else { return }
+        guard ProcessInfo.processInfo.environment["CLAUDE_SESSIONS_DISABLE_SETUP_PROMPTS"] != "1" else {
+            return
+        }
+        var missing: [SessionSource] = []
+        if !HookInstaller.isInstalled(),
+           !UserDefaults.standard.bool(forKey: "HookInstallDeclined.claude") {
+            missing.append(.claude)
+        }
+        if !CodexHookInstaller.isInstalled(),
+           !UserDefaults.standard.bool(forKey: "HookInstallDeclined.codex") {
+            missing.append(.codex)
+        }
+        guard !missing.isEmpty else { return }
         let alert = NSAlert()
-        alert.messageText = "Set up Claude Code session tracking?"
+        alert.messageText = "Set up accurate session tracking?"
+        let names = missing.map(\.displayName).joined(separator: " and ")
         alert.informativeText = """
-        ClaudeSessions adds seven hook entries to ~/.claude/settings.json so \
-        Claude Code reports each session's status to the panel. Your current \
-        settings are backed up to settings.json.bak first.
+        ClaudeSessions can add lifecycle hooks for \(names) so the panel shows \
+        working, waiting, done, errors, resumable IDs, and subagents accurately. \
+        Existing settings are backed up first. Codex will ask you to review the \
+        new hooks once with /hooks.
         """
-        alert.addButton(withTitle: "Install Hooks")
+        alert.addButton(withTitle: "Install Tracking")
         alert.addButton(withTitle: "Not Now")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            runHookInstall()
+            runHookInstall(sources: missing)
         } else {
-            UserDefaults.standard.set(true, forKey: "HookInstallDeclined")
+            for source in missing {
+                UserDefaults.standard.set(true, forKey: "HookInstallDeclined.\(source.rawValue)")
+            }
         }
     }
 
     @objc fileprivate func installHooksClicked() {
-        UserDefaults.standard.set(false, forKey: "HookInstallDeclined")
-        runHookInstall()
+        UserDefaults.standard.set(false, forKey: "HookInstallDeclined.claude")
+        runHookInstall(sources: [.claude])
     }
 
-    private func runHookInstall() {
+    @objc fileprivate func installCodexHooksClicked() {
+        UserDefaults.standard.set(false, forKey: "HookInstallDeclined.codex")
+        runHookInstall(sources: [.codex])
+    }
+
+    private func runHookInstall(sources: [SessionSource]) {
         let done = NSAlert()
         do {
-            try HookInstaller.install()
-            done.messageText = "Hooks installed"
-            done.informativeText = "Claude Code sessions will report their status from their next turn on."
+            for source in sources {
+                switch source {
+                case .claude: try HookInstaller.install()
+                case .codex: try CodexHookInstaller.install()
+                }
+            }
+            done.messageText = "Session tracking installed"
+            done.informativeText = sources.contains(.codex)
+                ? "Statuses update from the next turn. In Codex, run /hooks once and trust the ClaudeSessions entries."
+                : "Claude sessions will report their status from their next turn on."
         } catch {
             done.messageText = "Couldn't install hooks"
             done.informativeText = error.localizedDescription
@@ -948,6 +1553,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Clear the other CLI's rows right away; the mark spins until the
         // first fetch for the new source lands.
         lastSessions = []
+        liveSessions = []
         hadFirstData = false
         headerMark.spinning = true
         render(sessions: [])
@@ -1415,15 +2021,20 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Refresh
 
     private func refresh() {
-        if paused { return }
+        if paused || refreshInFlight { return }
+        refreshInFlight = true
         let src = source
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        refreshQueue.async { [weak self] in
             guard let self = self else { return }
             let result = src == .codex ? self.dataSource.fetchCodex() : self.dataSource.fetch()
             DispatchQueue.main.async {
+                self.refreshInFlight = false
                 // A slow fetch from before a source switch must not paint the
                 // other CLI's sessions.
-                guard self.source == src else { return }
+                guard self.source == src else {
+                    self.refresh()
+                    return
+                }
                 self.apply(result)
             }
         }
@@ -1433,7 +2044,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         lastReachable = result.reachable
         if result.reachable {
             hadFirstData = true
-            lastSessions = result.sessions
+            liveSessions = result.sessions
+            lastSessions = sessionsForDisplay(live: result.sessions)
             footerLabel.isHidden = true
         } else {
             // Keep last rows; show footer.
@@ -1459,6 +2071,12 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
         render(sessions: lastSessions)
+    }
+
+    private func sessionsForDisplay(live: [Session]) -> [Session] {
+        guard showRecent else { return live }
+        let liveIds = Set(live.filter { !$0.isSyntheticChild }.map(\.stableId))
+        return live + recentStore.recent(source: source, excluding: liveIds)
     }
 
     private var renderDeferred = false
@@ -1531,6 +2149,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             } else {
                 let v = RowView(session: s)
                 v.onClick = { [weak self] r in self?.handleClick(r) }
+                v.onMenu = { [weak self] r in self?.buildRowMenu(for: r) }
                 v.translatesAutoresizingMaskIntoConstraints = false
                 rowViews[s.sessionId] = v
                 row = v
@@ -1607,6 +2226,10 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func handleClick(_ row: RowView) {
         let session = row.session
+        if !session.isLive {
+            resumeSession(session)
+            return
+        }
         let host = HostResolver.shared.host(forPid: session.pid)
         dbg("click session=\(session.name) pid=\(session.pid) host=\(host) hostPid=\(String(describing: HostResolver.shared.hostPid(forPid: session.pid)))")
         focus(host: host, session: session)
@@ -1617,26 +2240,183 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func markSeen(_ session: Session) {
-        let dir = Env.statusDir
+        let dir = Env.statusDir(for: session.source)
         let path = (dir as NSString).appendingPathComponent("\(session.sessionId).json")
-        let obj: [String: Any] = [
-            "session_id": session.sessionId,
-            "status": "idle",
-            "cwd": session.cwd,
-            "updated_at": Int(Date().timeIntervalSince1970),
-            "event": "seen",
-        ]
+        var obj: [String: Any] = [:]
+        if let existing = FileManager.default.contents(atPath: path),
+           let decoded = (try? JSONSerialization.jsonObject(with: existing)) as? [String: Any] {
+            obj = decoded
+        }
+        obj["session_id"] = session.sessionId
+        obj["status"] = "idle"
+        obj["cwd"] = session.cwd
+        obj["updated_at"] = Int(Date().timeIntervalSince1970)
+        obj["event"] = "seen"
         if let data = try? JSONSerialization.data(withJSONObject: obj) {
-            try? data.write(to: URL(fileURLWithPath: path))
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
         // Reflect immediately.
         if let idx = lastSessions.firstIndex(where: { $0.sessionId == session.sessionId }) {
-            let s = lastSessions[idx]
-            lastSessions[idx] = Session(sessionId: s.sessionId, name: s.name, cwd: s.cwd,
-                                        pid: s.pid, status: .idle, fromFile: true,
-                                        parentId: s.parentId)
+            lastSessions[idx].status = .idle
+            if let liveIdx = liveSessions.firstIndex(where: { $0.sessionId == session.sessionId }) {
+                liveSessions[liveIdx].status = .idle
+            }
             render(sessions: lastSessions)
         }
+    }
+
+    // MARK: Per-session actions
+
+    private func buildRowMenu(for row: RowView) -> NSMenu? {
+        let clicked = row.session
+        let session = clicked.parentId
+            .flatMap { parent in lastSessions.first(where: { $0.sessionId == parent }) }
+            ?? clicked
+        let menu = NSMenu()
+        if session.isLive {
+            menu.addItem(rowMenuItem("Focus Session", action: #selector(focusSessionMenu(_:)), session: session))
+        } else {
+            menu.addItem(rowMenuItem("Resume in Terminal", action: #selector(resumeSessionMenu(_:)), session: session))
+        }
+        menu.addItem(rowMenuItem("Rename Panel Label…", action: #selector(renameSessionMenu(_:)), session: session))
+        if session.resumeId != nil {
+            menu.addItem(rowMenuItem("Copy Resume Command", action: #selector(copyResumeCommandMenu(_:)), session: session))
+        }
+        menu.addItem(.separator())
+        if session.isLive {
+            menu.addItem(rowMenuItem("Interrupt Current Turn", action: #selector(interruptSessionMenu(_:)), session: session))
+            menu.addItem(rowMenuItem("Terminate Session…", action: #selector(terminateSessionMenu(_:)), session: session))
+        } else {
+            menu.addItem(rowMenuItem("Forget Recent Session", action: #selector(forgetSessionMenu(_:)), session: session))
+        }
+        return menu
+    }
+
+    private func rowMenuItem(_ title: String, action: Selector, session: Session) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = session.sessionId as NSString
+        return item
+    }
+
+    private func menuSession(_ sender: NSMenuItem) -> Session? {
+        guard let id = sender.representedObject as? String else { return nil }
+        return lastSessions.first { $0.sessionId == id }
+    }
+
+    @objc private func focusSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender), session.isLive else { return }
+        focus(host: HostResolver.shared.host(forPid: session.pid), session: session)
+        if session.status == .doneUnseen { markSeen(session) }
+    }
+
+    @objc private func resumeSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        resumeSession(session)
+    }
+
+    private func resumeSession(_ session: Session) {
+        switch TerminalLauncher.resume(session) {
+        case .success:
+            showActionFeedback("Resuming \(session.name)", color: .systemGreen)
+        case .failure(let error):
+            showActionError(error)
+        }
+    }
+
+    @objc private func copyResumeCommandMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        switch ResumeCommandBuilder.command(for: session) {
+        case .success(let command):
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(command, forType: .string)
+            showActionFeedback("Resume command copied", color: .secondaryLabelColor)
+        case .failure(let error):
+            showActionError(error)
+        }
+    }
+
+    @objc private func renameSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename panel label"
+        alert.informativeText = "This changes how the session appears in ClaudeSessions; its resumable session ID stays the same."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: session.name)
+        field.placeholderString = "Session label"
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 24)
+        alert.accessoryView = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let newName = recentStore.rename(session, to: field.stringValue)
+        for index in liveSessions.indices where liveSessions[index].stableId == session.stableId {
+            liveSessions[index].name = newName
+        }
+        lastSessions = sessionsForDisplay(live: liveSessions)
+        render(sessions: lastSessions)
+    }
+
+    @objc private func interruptSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        switch SessionControl.interrupt(session) {
+        case .success:
+            showActionFeedback("Interrupt sent to \(session.name)", color: .systemOrange)
+        case .failure(let error):
+            showActionError(error)
+        }
+    }
+
+    @objc private func terminateSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Terminate \(session.name)?"
+        alert.informativeText = "This closes the live CLI process. Its transcript remains available and can be resumed later."
+        alert.addButton(withTitle: "Terminate")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        switch SessionControl.terminate(session) {
+        case .success:
+            showActionFeedback("Terminating \(session.name)", color: .systemOrange)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.refresh() }
+        case .failure(let error):
+            showActionError(error)
+        }
+    }
+
+    @objc private func forgetSessionMenu(_ sender: NSMenuItem) {
+        guard let session = menuSession(sender) else { return }
+        recentStore.forget(session)
+        lastSessions = sessionsForDisplay(live: liveSessions)
+        render(sessions: lastSessions)
+    }
+
+    private var actionFeedbackGeneration = 0
+
+    private func showActionFeedback(_ text: String, color: NSColor) {
+        actionFeedbackGeneration += 1
+        let generation = actionFeedbackGeneration
+        footerLabel.stringValue = text
+        footerLabel.textColor = color
+        footerLabel.isHidden = isCollapsed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.actionFeedbackGeneration == generation else { return }
+            if self.lastReachable {
+                self.footerLabel.isHidden = true
+            } else {
+                self.footerLabel.stringValue = "daemon unreachable"
+                self.footerLabel.textColor = .systemOrange
+            }
+        }
+    }
+
+    private func showActionError(_ error: Error) {
+        let alert = NSAlert(error: error)
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     // Focus must NEVER create windows/tabs/projects. Strategy per host:
@@ -1656,6 +2436,22 @@ final class AppController: NSObject, NSApplicationDelegate {
                                   fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .pycharm:
             raiseWindowOrActivate(processName: "PyCharm", bundlePrefix: "com.jetbrains.pycharm",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
+        case .warp:
+            raiseWindowOrActivate(processName: "Warp", bundlePrefix: "dev.warp",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
+        case .wezterm:
+            raiseWindowOrActivate(processName: "wezterm-gui", bundlePrefix: "com.github.wez.wezterm",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
+        case .kitty:
+            raiseWindowOrActivate(processName: "kitty", bundlePrefix: "net.kovidgoyal.kitty",
+                                  titleNeedle: (session.cwd as NSString).lastPathComponent,
+                                  fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
+        case .alacritty:
+            raiseWindowOrActivate(processName: "Alacritty", bundlePrefix: "org.alacritty",
                                   titleNeedle: (session.cwd as NSString).lastPathComponent,
                                   fallbackPid: HostResolver.shared.hostPid(forPid: session.pid))
         case .unknown:
@@ -1756,13 +2552,16 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func focusTerminal(session: Session) {
         let name = session.name
+        let tty = runProcess("/bin/ps", ["-o", "tty=", "-p", "\(session.pid)"], timeout: 2)?
+            .out.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let script = """
         tell application "Terminal"
             activate
             repeat with w in windows
                 repeat with t in tabs of w
                     try
-                        if (custom title of t contains "\(escapeAS(name))") then
+                        if ((tty of t ends with "\(escapeAS(tty))" and "\(escapeAS(tty))" is not "") or \
+                            (custom title of t contains "\(escapeAS(name))")) then
                             set selected of t to true
                             set index of w to 1
                             return
@@ -1808,6 +2607,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         pauseItem.target = self
         menu.addItem(pauseItem)
 
+        let recentItem = NSMenuItem(title: "Show Recent Sessions",
+                                    action: #selector(toggleRecentSessions), keyEquivalent: "")
+        recentItem.target = self
+        recentItem.state = showRecent ? .on : .off
+        menu.addItem(recentItem)
+
+        if showRecent {
+            let clearRecent = NSMenuItem(title: "Clear \(source.displayName) Recent Sessions",
+                                         action: #selector(clearRecentSessions), keyEquivalent: "")
+            clearRecent.target = self
+            menu.addItem(clearRecent)
+        }
+
         let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = launchAtLoginEnabled() ? .on : .off
@@ -1821,6 +2633,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         hooksItem.state = hooksInstalled ? .on : .off
         menu.addItem(hooksItem)
 
+        let codexHooksInstalled = CodexHookInstaller.isInstalled()
+        let codexHooksItem = NSMenuItem(
+            title: codexHooksInstalled ? "Codex Hooks: Installed" : "Install Codex Hooks…",
+            action: #selector(installCodexHooksClicked), keyEquivalent: "")
+        codexHooksItem.target = self
+        codexHooksItem.state = codexHooksInstalled ? .on : .off
+        menu.addItem(codexHooksItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
@@ -1831,6 +2651,19 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc private func togglePause() {
         paused.toggle()
         if !paused { refresh() }
+    }
+
+    @objc private func toggleRecentSessions() {
+        showRecent.toggle()
+        UserDefaults.standard.set(showRecent, forKey: "ShowRecentSessions")
+        lastSessions = sessionsForDisplay(live: liveSessions)
+        render(sessions: lastSessions)
+    }
+
+    @objc private func clearRecentSessions() {
+        recentStore.clear(source: source)
+        lastSessions = sessionsForDisplay(live: liveSessions)
+        render(sessions: lastSessions)
     }
 
     @objc private func quit() {
@@ -1878,12 +2711,17 @@ final class AppController: NSObject, NSApplicationDelegate {
 // a downloaded app needs zero terminal setup. Must never block Claude Code:
 // every failure path is a silent no-op.
 enum HookRunner {
-    static func run() {
+    static func run(source: SessionSource = .claude) {
+        defer {
+            // Codex Stop/SubagentStop hooks require JSON on stdout. An empty
+            // object means "observe only; do not alter the agent loop."
+            if source == .codex { print("{}") }
+        }
         let input = FileHandle.standardInput.readDataToEndOfFile()
         guard let payload = (try? JSONSerialization.jsonObject(with: input)) as? [String: Any],
               let event = payload["hook_event_name"] as? String,
               let sid = payload["session_id"] as? String, !sid.isEmpty else { return }
-        let dir = Env.statusDir
+        let dir = Env.statusDir(for: source)
         let file = (dir as NSString).appendingPathComponent("\(sid).json")
         let fm = FileManager.default
 
@@ -1899,32 +2737,55 @@ enum HookRunner {
         }
         obj["session_id"] = sid
         if let cwd = payload["cwd"] as? String, !cwd.isEmpty { obj["cwd"] = cwd }
-        if let t = transcriptTitle(payload["transcript_path"] as? String), !t.isEmpty {
+        if source == .claude,
+           let t = transcriptTitle(payload["transcript_path"] as? String), !t.isEmpty {
             obj["title"] = t
         }
         obj["updated_at"] = Int(Date().timeIntervalSince1970)
         obj["event"] = event
+        obj["source"] = source.rawValue
+        let recordedPid = (obj["pid"] as? NSNumber)?.int32Value
+        if recordedPid == nil || Darwin.kill(recordedPid!, 0) != 0,
+           let pid = agentProcessPid(source: source) {
+            obj["pid"] = pid
+        }
+        if let turnId = payload["turn_id"] as? String { obj["turn_id"] = turnId }
 
         var children = (obj["children"] as? [[String: Any]]) ?? []
 
         switch event {
+        case "SessionStart":
+            obj["status"] = "idle"
+            obj.removeValue(forKey: "stop_pending")
+            children = []
         case "UserPromptSubmit":
             // New turn starts clean.
             obj["status"] = "working"
+            obj.removeValue(forKey: "stop_pending")
             children = []
         case "Notification":
             obj["status"] = "waiting"
+        case "PermissionRequest":
+            obj["status"] = "waiting"
+        case "PreToolUse":
+            obj["status"] = "working"
+            obj.removeValue(forKey: "stop_pending")
+        case "PostToolUse":
+            obj["status"] = toolResponseFailed(payload["tool_response"]) ? "error" : "working"
+            obj.removeValue(forKey: "stop_pending")
         case "Stop":
             // Same guard as the stop sound: still working while background
             // tasks run or scheduled wakeups (crons) are pending.
-            let tasks = (payload["background_tasks"] as? [[String: Any]]) ?? []
+            let tasks = source == .claude
+                ? ((payload["background_tasks"] as? [[String: Any]]) ?? []) : []
             let running = tasks.filter { ($0["status"] as? String) == "running" }
-            let crons = (payload["session_crons"] as? [Any]) ?? []
+            let crons = source == .claude ? ((payload["session_crons"] as? [Any]) ?? []) : []
             // Agent children are owned by the SubagentStart/Stop lifecycle
             // (which knows their given names); tasks are republished fresh.
             children = children.filter { ($0["kind"] as? String) == "agent" }
-            if !running.isEmpty || !crons.isEmpty {
+            if !running.isEmpty || !crons.isEmpty || (source == .codex && !children.isEmpty) {
                 obj["status"] = "working"
+                if source == .codex { obj["stop_pending"] = true }
                 for t in running {
                     let kind = (t["type"] as? String) ?? "task"
                     // A lingering teammate here would only duplicate the
@@ -1938,6 +2799,7 @@ enum HookRunner {
                 }
             } else {
                 obj["status"] = "done_unseen"
+                obj.removeValue(forKey: "stop_pending")
             }
         case "StopFailure":
             obj["status"] = "error"
@@ -1950,6 +2812,10 @@ enum HookRunner {
         case "SubagentStop":
             let id = str(payload, "agent_id", "agentId", "task_id", "id") ?? "agent"
             children.removeAll { ($0["id"] as? String) == id }
+            if source == .codex, children.isEmpty, (obj["stop_pending"] as? Bool) == true {
+                obj["status"] = "done_unseen"
+                obj.removeValue(forKey: "stop_pending")
+            }
         default:
             return
         }
@@ -1983,16 +2849,53 @@ enum HookRunner {
         }
         return line["aiTitle"] as? String
     }
+
+    /// Hook commands are launched beneath a short-lived shell. Walk upward to
+    /// bind the hook status file to the actual interactive Claude/Codex pid.
+    private static func agentProcessPid(source: SessionSource) -> Int? {
+        let overrideKey = source == .claude ? "CLAUDE_SESSION_AGENT_PID" : "CODEX_SESSION_AGENT_PID"
+        if let raw = ProcessInfo.processInfo.environment[overrideKey], let pid = Int(raw), pid > 1 {
+            return pid
+        }
+        var current = Int(getppid())
+        for _ in 0..<12 where current > 1 {
+            guard let result = runProcess("/bin/ps", ["-o", "ppid=,command=", "-p", "\(current)"], timeout: 2),
+                  result.code == 0 else { return nil }
+            let line = result.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let split = line.firstIndex(where: { $0 == " " }) else { return nil }
+            let ppidText = line[..<split].trimmingCharacters(in: .whitespaces)
+            let command = line[line.index(after: split)...].lowercased()
+            let isHookProcess = command.contains("claudesessions")
+                || command.contains("session-status")
+            let matches = !isHookProcess
+                && (source == .claude ? command.contains("claude") : command.contains("codex"))
+            if matches { return current }
+            guard let parent = Int(ppidText), parent > 1 else { return nil }
+            current = parent
+        }
+        return nil
+    }
+
+    private static func toolResponseFailed(_ value: Any?) -> Bool {
+        guard let object = value as? [String: Any] else { return false }
+        if (object["is_error"] as? Bool) == true { return true }
+        if let success = object["success"] as? Bool, !success { return true }
+        if let code = object["exit_code"] as? NSNumber, code.intValue != 0 { return true }
+        if let status = object["status"] as? String,
+           ["error", "failed", "failure"].contains(status.lowercased()) { return true }
+        for key in ["result", "metadata"] where toolResponseFailed(object[key]) { return true }
+        return false
+    }
 }
 
 // MARK: - Hook installer (plug-and-play setup)
 //
-// Registers `<this binary> --hook` for the seven session-status events in
+// Registers `<this binary> --hook` for the eight session-status events in
 // ~/.claude/settings.json so a downloaded app works without any terminal
 // steps. A developer install using hooks/session-status.sh counts as
 // installed — never double-register.
 enum HookInstaller {
-    static let events = ["UserPromptSubmit", "Notification", "Stop", "StopFailure",
+    static let events = ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "StopFailure",
                          "SessionEnd", "SubagentStart", "SubagentStop"]
 
     static var settingsPath: String {
@@ -2057,10 +2960,87 @@ enum HookInstaller {
     }
 }
 
+// Codex lifecycle hooks use ~/.codex/hooks.json. They provide stable session
+// IDs and exact working/waiting/done transitions; process scanning remains the
+// zero-setup fallback until the user reviews these hooks with /hooks.
+enum CodexHookInstaller {
+    static let events = ["SessionStart", "UserPromptSubmit", "PermissionRequest",
+                         "PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"]
+
+    static var settingsPath: String {
+        if let override = ProcessInfo.processInfo.environment["CODEX_HOOKS_PATH"],
+           !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
+        }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(".codex/hooks.json")
+    }
+
+    static var hookCommand: String {
+        "\"\(Bundle.main.executablePath ?? "")\" --codex-hook"
+    }
+
+    private static func isOurs(_ command: String) -> Bool {
+        command.contains("ClaudeSessions") && command.contains("--codex-hook")
+    }
+
+    private static func commands(in settings: [String: Any], event: String) -> [String] {
+        guard let hooks = settings["hooks"] as? [String: Any],
+              let entries = hooks[event] as? [[String: Any]] else { return [] }
+        return entries.flatMap { entry in
+            ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["command"] as? String }
+        }
+    }
+
+    static func isInstalled() -> Bool {
+        guard let data = FileManager.default.contents(atPath: settingsPath),
+              let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return false
+        }
+        return events.allSatisfy { commands(in: settings, event: $0).contains(where: isOurs) }
+    }
+
+    static func install() throws {
+        let fm = FileManager.default
+        var settings: [String: Any] = [:]
+        if let data = fm.contents(atPath: settingsPath) {
+            guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                throw NSError(domain: "CodexHookInstaller", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "\(settingsPath) is not valid JSON. Fix it first — nothing was changed."])
+            }
+            settings = parsed
+            try data.write(to: URL(fileURLWithPath: settingsPath + ".bak"), options: .atomic)
+        } else {
+            try fm.createDirectory(atPath: (settingsPath as NSString).deletingLastPathComponent,
+                                   withIntermediateDirectories: true)
+        }
+        var hooks = (settings["hooks"] as? [String: Any]) ?? [:]
+        for event in events {
+            if commands(in: settings, event: event).contains(where: isOurs) { continue }
+            var entries = (hooks[event] as? [[String: Any]]) ?? []
+            var entry: [String: Any] = [
+                "hooks": [["type": "command", "command": hookCommand, "timeout": 5]]
+            ]
+            if event == "SessionStart" { entry["matcher"] = "startup|resume|clear|compact" }
+            entries.append(entry)
+            hooks[event] = entries
+        }
+        settings["hooks"] = hooks
+        let out = try JSONSerialization.data(withJSONObject: settings,
+                                             options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: URL(fileURLWithPath: settingsPath), options: .atomic)
+    }
+}
+
 // MARK: - Entry point
 
+if CommandLine.arguments.contains("--codex-hook") {
+    HookRunner.run(source: .codex)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--hook") {
-    HookRunner.run()
+    HookRunner.run(source: .claude)
     exit(0)
 }
 
@@ -2073,6 +3053,93 @@ if CommandLine.arguments.contains("--install-hooks") {
     } catch {
         FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
         exit(1)
+    }
+}
+
+if CommandLine.arguments.contains("--install-codex-hooks") {
+    do {
+        try CodexHookInstaller.install()
+        print("Codex hooks installed into \(CodexHookInstaller.settingsPath)")
+        print("Run /hooks in Codex once to review and trust the new entries.")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--resume-command") {
+    let args = CommandLine.arguments
+    guard args.count > index + 3,
+          let source = SessionSource(rawValue: args[index + 1]) else {
+        FileHandle.standardError.write(Data("usage: ClaudeSessions --resume-command claude|codex SESSION_ID CWD\n".utf8))
+        exit(2)
+    }
+    let session = Session(sessionId: args[index + 2], name: args[index + 2],
+                          cwd: args[index + 3], pid: 0, status: .inactive,
+                          fromFile: false, source: source,
+                          resumeId: args[index + 2], isLive: false)
+    switch ResumeCommandBuilder.command(for: session) {
+    case .success(let command):
+        print(command)
+        exit(0)
+    case .failure(let error):
+        FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--snapshot-json") {
+    let args = CommandLine.arguments
+    guard args.count > index + 1, let source = SessionSource(rawValue: args[index + 1]) else {
+        FileHandle.standardError.write(Data("usage: ClaudeSessions --snapshot-json claude|codex\n".utf8))
+        exit(2)
+    }
+    let dataSource = DataSource()
+    let result = source == .claude ? dataSource.fetch() : dataSource.fetchCodex()
+    let rows: [[String: Any]] = result.sessions.map { session in
+        [
+            "session_id": session.sessionId,
+            "resume_id": session.resumeId ?? NSNull(),
+            "name": session.name,
+            "cwd": session.cwd,
+            "pid": session.pid,
+            "status": session.status.label.lowercased(),
+            "source": session.source.rawValue,
+            "parent_id": session.parentId ?? NSNull(),
+            "live": session.isLive,
+        ]
+    }
+    let payload: [String: Any] = ["reachable": result.reachable, "sessions": rows]
+    if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+       let text = String(data: data, encoding: .utf8) {
+        print(text)
+        exit(result.reachable ? 0 : 1)
+    }
+    exit(1)
+}
+
+for (flag, action) in [
+    ("--interrupt-pid", SessionControl.interrupt),
+    ("--terminate-pid", SessionControl.terminate),
+] {
+    if let index = CommandLine.arguments.firstIndex(of: flag) {
+        let args = CommandLine.arguments
+        guard args.count > index + 2,
+              let source = SessionSource(rawValue: args[index + 1]),
+              let pid = Int(args[index + 2]) else {
+            FileHandle.standardError.write(Data("usage: ClaudeSessions \(flag) claude|codex PID\n".utf8))
+            exit(2)
+        }
+        let session = Session(sessionId: "cli-\(pid)", name: source.displayName,
+                              cwd: "", pid: pid, status: .working,
+                              fromFile: false, source: source, isLive: true)
+        switch action(session) {
+        case .success: exit(0)
+        case .failure(let error):
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
     }
 }
 

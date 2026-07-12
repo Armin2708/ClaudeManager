@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC="$REPO_DIR/src/main.swift"
 
-APP_DIR="$HOME/Applications/ClaudeSessions.app"
+APP_DIR="${APP_DIR_OVERRIDE:-$HOME/Applications/ClaudeSessions.app}"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
 BIN="$MACOS_DIR/ClaudeSessions"
 PLIST="$APP_DIR/Contents/Info.plist"
 
 echo "==> Assembling bundle at $APP_DIR"
+rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$APP_DIR/Contents/Resources"
 
@@ -23,11 +24,11 @@ ICON="$REPO_DIR/assets/ClaudeSessions.icns"
 if [ ! -f "$ICON" ]; then
   bash "$SCRIPT_DIR/make-icon.sh"
 fi
-cp "$ICON" "$APP_DIR/Contents/Resources/ClaudeSessions.icns"
+cp -X "$ICON" "$APP_DIR/Contents/Resources/ClaudeSessions.icns"
 
 # Source-toggle logos (rendered as template images at runtime)
-cp "$REPO_DIR/assets/claude-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
-cp "$REPO_DIR/assets/codex-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
+cp -X "$REPO_DIR/assets/claude-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
+cp -X "$REPO_DIR/assets/codex-logo.svg" "$APP_DIR/Contents/Resources/" 2>/dev/null || true
 
 echo "==> Writing Info.plist"
 cat > "$PLIST" <<'PLIST_EOF'
@@ -46,9 +47,9 @@ cat > "$PLIST" <<'PLIST_EOF'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -64,7 +65,12 @@ cat > "$PLIST" <<'PLIST_EOF'
 PLIST_EOF
 
 echo "==> Codesigning (ad-hoc)"
+# Finder metadata/resource forks become real ._* files when a ZIP is unpacked
+# with `unzip`, invalidating the resource seal. Strip them before signing.
+xattr -cr "$APP_DIR"
+find "$APP_DIR" -name '._*' -delete
 codesign --force --deep -s - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
 
 echo "==> Done: $APP_DIR"
 echo "    Binary: $BIN"

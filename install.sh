@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-RELEASE_URL="https://github.com/Armin2708/ClaudeManager/releases/latest/download/ClaudeSessions.zip"
+RELEASE_URL="${CLAUDE_SESSIONS_RELEASE_URL:-https://github.com/Armin2708/ClaudeManager/releases/latest/download/ClaudeSessions.zip}"
 APP_NAME="ClaudeSessions.app"
-INSTALL_DIR="$HOME/Applications"
+INSTALL_DIR="${CLAUDE_SESSIONS_INSTALL_DIR:-$HOME/Applications}"
 APP_PATH="$INSTALL_DIR/$APP_NAME"
 
 # Work in a temporary directory; clean it up on exit no matter what.
@@ -32,11 +32,23 @@ if [ ! -d "$TMP_DIR/$APP_NAME" ]; then
   exit 1
 fi
 
+if find "$TMP_DIR/$APP_NAME" -name '._*' -print -quit | grep -q .; then
+  echo "Error: downloaded app contains invalid AppleDouble metadata." >&2
+  exit 1
+fi
+
+if ! codesign --verify --deep --strict "$TMP_DIR/$APP_NAME"; then
+  echo "Error: downloaded app failed code-signature verification." >&2
+  exit 1
+fi
+
 # Install to ~/Applications (user-level, no sudo needed).
 mkdir -p "$INSTALL_DIR"
 
-# Stop a running copy and replace any existing install.
-pkill -x ClaudeSessions || true
+# Only replace the installed copy after the download has passed verification.
+if [ "${CLAUDE_SESSIONS_SKIP_LAUNCH:-0}" != "1" ]; then
+  pkill -x ClaudeSessions || true
+fi
 rm -rf "$APP_PATH"
 mv "$TMP_DIR/$APP_NAME" "$APP_PATH"
 
@@ -47,13 +59,18 @@ xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
 echo "Installed $APP_NAME to $INSTALL_DIR."
 
 echo "Launching ClaudeSessions..."
-open "$APP_PATH"
+if [ "${CLAUDE_SESSIONS_SKIP_LAUNCH:-0}" = "1" ]; then
+  echo "Launch skipped by CLAUDE_SESSIONS_SKIP_LAUNCH."
+else
+  open "$APP_PATH"
+fi
 
 echo ""
 echo "Next steps:"
-echo "  1. The app will ask to install its Claude Code hooks — click \"Install Hooks\"."
-echo "     (It backs up ~/.claude/settings.json to settings.json.bak first.)"
-echo "  2. If macOS asks to let ClaudeSessions control iTerm2, approve it —"
+echo "  1. The app will ask to install Claude and Codex lifecycle tracking."
+echo "     Existing settings files are backed up first."
+echo "  2. In Codex, run /hooks once and trust the ClaudeSessions entries."
+echo "  3. If macOS asks to let ClaudeSessions control your terminal, approve it —"
 echo "     that's how tab titles and click-to-focus work."
 echo ""
 echo "Done. Look for the panel under your notch."
