@@ -1,13 +1,49 @@
 {
-  "repoPath": "/Users/arminrad/Desktop/claude-sessions-panel",
-  "lastCommit": "033d3ce01a8ba16fef0f1a1dfccfe153432c40dd",
-  "indexedAt": "2026-07-10T11:52:53.326Z",
+  "repoPath": "/Users/arminrad/Desktop/claude-sessions-panel-session-manager",
+  "lastCommit": "1b01868d581b5fe5b23db7bed3e26386c19a1405",
+  "indexedAt": "2026-07-12T11:49:52.478Z",
+  "branch": "codex/complete-session-manager",
+  "remoteUrl": "https://github.com/Armin2708/ClaudeManager",
   "stats": {
-    "files": 11,
-    "nodes": 54,
-    "edges": 45,
-    "communities": 0,
-    "processes": 0,
+    "files": 12,
+    "nodes": 635,
+    "edges": 1352,
+    "communities": 16,
+    "processes": 57,
     "embeddings": 0
-  }
+  },
+  "capabilities": {
+    "graph": {
+      "provider": "ladybugdb",
+      "status": "available"
+    },
+    "fts": {
+      "provider": "ladybugdb-fts",
+      "status": "available"
+    },
+    "vectorSearch": {
+      "provider": "ladybugdb-vector",
+      "status": "unavailable",
+      "exactScanLimit": 10000
+    }
+  },
+  "schemaVersion": 5,
+  "cjkSegmentation": "none",
+  "fileHashes": {
+    "install.sh": "4b2542d4a2011d5087e099c0ce77729b7e8bead5e41d841cc37dbd6844f88b10",
+    "README.md": "c0a313fbac7828a4893d5ae2d57f2a4dc466d02a21b4472623fd90d825817c63",
+    "CLAUDE.md": "d2e4c34660c5192a007c4e6c01b18ec7a728123866b4eabed4ef4bbf8263b355",
+    "AGENTS.md": "d2e4c34660c5192a007c4e6c01b18ec7a728123866b4eabed4ef4bbf8263b355",
+    "tests/run.sh": "27d442d24a2558528c2fb749edc424d4a7dcf4b6ed518413a58f1a82db1549f9",
+    "scripts/package.sh": "b027b99501613a0583380e84af6a6b8d32d8a126cfb5b9691d45b7abbeea6df4",
+    "scripts/make-icon.sh": "b12bfb58270470e40431ae07f6d9b3263ab01a93ece1e2f6528d92c0516fb10e",
+    "scripts/build.sh": "e8cbe22c1e9529c52c69029b334711a43351ca4424ea7ef7ae9a34552c6c2478",
+    "hooks/session-status.sh": "681ff006a3e7f94179ee2e41ae50cf04abdc49667c8c031d7218a6d139308630",
+    "src/main.swift": "1c2bc6def177452c14fcccf6eb6711cb9a97dd5d4c3d52aaf98ed5d2adf9e124",
+    "assets/ClaudeSessions.icns": "6f0fdf214e40b9b3ca6e905285b87be5bf4656d0b3ebcd2015b7f4627e6d1a4d",
+    "docs/superpowers/specs/2026-07-09-claude-sessions-panel-design.md": "794361d728cd6d6f40b0f5bb1fe4aabc21fb773114edbbcb89089942756aa96d"
+  },
+  "cacheKeys": [
+    "a628af70846d640dac6a4c136bc55238d8411e813dbf9aacfe502b6cee2958f7"
+  ]
 }
